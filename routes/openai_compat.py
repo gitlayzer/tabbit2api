@@ -382,9 +382,12 @@ async def _stream_handler(
     start = time.time()
     error_msg = ""
     buffered_text = ""
+    streamed_text = ""
+    chunk_count = 0
+    in_tool_call_mode = False
     try:
-        if not has_tools:
-            yield f"data: {json.dumps({'id': completion_id, 'object': 'chat.completion.chunk', 'choices': [{'index': 0, 'delta': {'role': 'assistant', 'content': ''}, 'finish_reason': None}]})}\n\n"
+        # 1. 始终第一时间发送首包（带有 role: assistant），让客户端建立状态机
+        yield f"data: {json.dumps({'id': completion_id, 'object': 'chat.completion.chunk', 'choices': [{'index': 0, 'delta': {'role': 'assistant', 'content': ''}, 'finish_reason': None}]})}\n\n"
 
         async def _iterate_events():
             if use_v3:
@@ -398,61 +401,104 @@ async def _stream_handler(
             et, ed = event["event"], event["data"]
             if et == "error":
                 error_msg = ed.get("message", str(ed))
+                logger.warning(f"[STREAM] Tabbit error event: {error_msg}")
                 yield f"data: {json.dumps({'id': completion_id, 'object': 'chat.completion.chunk', 'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'stop'}]})}\n\n"
                 yield "data: [DONE]\n\n"
                 return
-            if et == "message_chunk" and "content" in ed:
-                chunk_piece = ed["content"]
-                if has_tools:
-                    buffered_text += chunk_piece
-                else:
-                    chunk = {
+
+            if et == "message_chunk":
+                chunk_count += 1
+                # 2. 支持 reasoning_content（思考过程），实时推流给客户端
+                if "reasoning_content" in ed and ed["reasoning_content"]:
+                    r_text = ed["reasoning_content"]
+                    r_chunk = {
                         "id": completion_id,
                         "object": "chat.completion.chunk",
-                        "choices": [{"index": 0, "delta": {"content": chunk_piece}, "finish_reason": None}],
+                        "choices": [{"index": 0, "delta": {"reasoning_content": r_text}, "finish_reason": None}],
                     }
-                    yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
-            elif et in ("message_finish", "finish"):
-                if not has_tools:
-                    yield f"data: {json.dumps({'id': completion_id, 'object': 'chat.completion.chunk', 'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'stop'}]})}\n\n"
+                    yield f"data: {json.dumps(r_chunk, ensure_ascii=False)}\n\n"
+
+                # 3. 处理普通正文 content
+                if "content" in ed and ed["content"]:
+                    chunk_piece = ed["content"]
+                    buffered_text += chunk_piece
+
+                    if not has_tools:
+                        # 普通无 tools 对话，直接纯实时流式输出
+                        chunk = {
+                            "id": completion_id,
+                            "object": "chat.completion.chunk",
+                            "choices": [{"index": 0, "delta": {"content": chunk_piece}, "finish_reason": None}],
+                        }
+                        yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+                    else:
+                        # 有 tools 对话：检查是否出现了 <tool_call
+                        if "<tool_call" in buffered_text:
+                            in_tool_call_mode = True
+
+                        if not in_tool_call_mode:
+                            # 尚未出现工具调用标记，安全流式发送给客户端，保持打字机效果
+                            if "<" in buffered_text:
+                                safe_len = buffered_text.rfind("<")
+                                to_send = buffered_text[len(streamed_text):safe_len]
+                            else:
+                                to_send = buffered_text[len(streamed_text):]
+
+                            if to_send:
+                                streamed_text += to_send
+                                chunk = {
+                                    "id": completion_id,
+                                    "object": "chat.completion.chunk",
+                                    "choices": [{"index": 0, "delta": {"content": to_send}, "finish_reason": None}],
+                                }
+                                yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+
+        logger.info(f"[STREAM] Event loop finished: chunks={chunk_count}, buffered_len={len(buffered_text)}, has_tools={has_tools}")
 
         if has_tools:
             clean_text, tool_calls = detect_all_tool_calls(buffered_text)
             if tool_calls:
+                # 提取出工具调用，输出标准的 tool_calls delta 和 finish_reason: "tool_calls"
                 chunks = build_openai_tool_stream_chunks(
                     completion_id=completion_id,
                     model=req_model,
                     tool_calls=tool_calls,
-                    content=clean_text,
+                    content="" if streamed_text else clean_text,
                 )
                 for c in chunks:
                     yield c
                 return
             else:
-                if clean_text:
+                # 纯文本对话（没有调用工具），补齐尚未发送的文本
+                remaining = buffered_text[len(streamed_text):]
+                if remaining:
                     chunk_text = {
                         "id": completion_id,
                         "object": "chat.completion.chunk",
-                        "choices": [{"index": 0, "delta": {"role": "assistant", "content": clean_text}, "finish_reason": None}],
+                        "choices": [{"index": 0, "delta": {"content": remaining}, "finish_reason": None}],
                     }
                     yield f"data: {json.dumps(chunk_text, ensure_ascii=False)}\n\n"
                 yield f"data: {json.dumps({'id': completion_id, 'object': 'chat.completion.chunk', 'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'stop'}]})}\n\n"
+        else:
+            yield f"data: {json.dumps({'id': completion_id, 'object': 'chat.completion.chunk', 'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'stop'}]})}\n\n"
 
         yield "data: [DONE]\n\n"
         if token_id:
             _tm.report_success(token_id)
     except Exception as e:
         error_msg = str(e)
+        logger.error(f"[STREAM] Exception in stream_handler: {e}", exc_info=True)
         if token_id:
             _tm.report_error(token_id)
         raise
     finally:
         duration = time.time() - start
-        _logs.add(LogEntry(
-            model=req_model, token_name=token_name, stream=True,
-            status="success" if not error_msg else "error",
-            duration=duration, error=error_msg
-        ))
+        if _logs:
+            _logs.add(LogEntry(
+                model=req_model, token_name=token_name, stream=True,
+                status="success" if not error_msg else "error",
+                duration=duration, error=error_msg
+            ))
 
 
 @router.post("/v1/chat/completions")
@@ -531,10 +577,11 @@ async def chat_completions(
         except Exception as e:
             if token_id:
                 _tm.report_error(token_id)
-            _logs.add(LogEntry(
-                model=getattr(req, "model", "unknown"), token_name=token_name,
-                stream=is_stream, status="error", error=str(e)
-            ))
+            if _logs:
+                _logs.add(LogEntry(
+                    model=getattr(req, "model", "unknown"), token_name=token_name,
+                    stream=is_stream, status="error", error=str(e)
+                ))
             raise HTTPException(status_code=502, detail=f"Failed to create chat session: {e}")
     
     completion_id = f"chatcmpl-{uuid.uuid4().hex}"
@@ -614,17 +661,19 @@ async def chat_completions(
         error_msg = str(e)
         if token_id:
             _tm.report_error(token_id)
-        _logs.add(LogEntry(
-            model=getattr(req, "model", "unknown"), token_name=token_name,
-            stream=False, status="error", error=error_msg
-        ))
+        if _logs:
+            _logs.add(LogEntry(
+                model=getattr(req, "model", "unknown"), token_name=token_name,
+                stream=False, status="error", error=error_msg
+            ))
         raise HTTPException(status_code=502, detail=str(e))
     
     duration = time.time() - start
-    _logs.add(LogEntry(
-        model=getattr(req, "model", "unknown"), token_name=token_name,
-        stream=False, status="success" if not error_msg else "error", duration=duration, error=error_msg
-    ))
+    if _logs:
+        _logs.add(LogEntry(
+            model=getattr(req, "model", "unknown"), token_name=token_name,
+            stream=False, status="success" if not error_msg else "error", duration=duration, error=error_msg
+        ))
 
     input_tokens = len(content) // 4
     output_tokens = len(full_text) // 4

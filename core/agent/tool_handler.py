@@ -81,6 +81,32 @@ def parse_claude_tools(tools: List[dict]) -> List[dict]:
     return result
 
 
+def _compact_parameters(params: Any) -> Any:
+    if not isinstance(params, dict):
+        return {}
+    props = params.get("properties")
+    if not isinstance(props, dict):
+        return params
+    compact_props = {}
+    for p_name, p_val in props.items():
+        if isinstance(p_val, dict):
+            compact_props[p_name] = {
+                "type": p_val.get("type", "string"),
+                "description": (p_val.get("description", "") or "")[:150],
+            }
+            if "enum" in p_val:
+                compact_props[p_name]["enum"] = p_val["enum"][:10]
+        else:
+            compact_props[p_name] = {"type": "string"}
+    result = {
+        "type": "object",
+        "properties": compact_props,
+    }
+    if "required" in params and isinstance(params["required"], list):
+        result["required"] = params["required"]
+    return result
+
+
 def build_tool_prompt(tools: List[dict]) -> str:
     """Build an authoritative tool-calling prompt to inject into the model context.
     Instructs the model to output strict <tool_call> XML format when invoking tools.
@@ -91,10 +117,11 @@ def build_tool_prompt(tools: List[dict]) -> str:
     tool_descriptions = []
     for t in tools:
         name = t.get("name", "")
-        desc = t.get("description", "")
-        params = json.dumps(t.get("parameters", {}), ensure_ascii=False)
+        desc = (t.get("description", "") or "")[:250]
+        compact_params = _compact_parameters(t.get("parameters", {}))
+        params_str = json.dumps(compact_params, ensure_ascii=False)
         tool_descriptions.append(
-            f"### Tool: {name}\n- Description: {desc}\n- Parameters Schema: {params}"
+            f"### Tool: {name}\n- Description: {desc}\n- Parameters Schema: {params_str}"
         )
 
     prompt = (
