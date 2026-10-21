@@ -32,8 +32,9 @@ class TokenManager:
             if now >= cooldown_until:
                 if t["id"] in self._cooldowns:
                     del self._cooldowns[t["id"]]
-                    # 冷却恢复 → 重置状态
-                    t["status"] = "unknown"
+                # 冷却结束或服务重启，重置状态
+                if t.get("status") == "cooldown":
+                    t["status"] = "active"
                     t["error_count"] = 0
                 available.append(t)
         return available
@@ -95,7 +96,9 @@ class TokenManager:
             return "cooldown"
         for t in self.config.get("tokens", default=[]):
             if t["id"] == token_id:
-                return t.get("status", "unknown")
+                if t.get("status") == "cooldown":
+                    t["status"] = "active"
+                return t.get("status", "active")
         return "unknown"
 
     async def close_all(self):

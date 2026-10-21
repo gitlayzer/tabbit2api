@@ -136,7 +136,7 @@ class TabbitClient:
         
         self.client = httpx.AsyncClient(
             timeout=httpx.Timeout(connect=15, read=180, write=30, pool=30),
-            follow_redirects=False,
+            follow_redirects=True,
             verify=False,
             limits=httpx.Limits(
                 max_connections=10,
@@ -234,28 +234,29 @@ class TabbitClient:
         if not session_id:
             raise Exception(f"Session creation failed: {resp.text[:500]}")
         
-        # Step 2: Initialize via RSC
-        router_state = [
-            "",
-            {"children": ["newtab", {"children": ["__PAGE__", {}, None, None]}, None, None]},
-            None, None, True,
-        ]
-        rsc_headers = {
-            **self._get_headers("/newtab"),
-            "rsc": "1",
-            "next-url": "/newtab",
-            "next-router-state-tree": urllib.parse.quote(json.dumps(router_state)),
-            "Accept": "*/*",
-            "Referer": f"{self.base_url}/newtab",
-        }
-        rsc_resp = await self.client.get(
-            f"{self.base_url}/session/{session_id}",
-            params={"_rsc": "kfw4t"},
-            headers=rsc_headers,
-            cookies=self._get_cookies(),
-        )
-        if rsc_resp.status_code != 200:
-            raise Exception(f"RSC init error {rsc_resp.status_code}")
+        # Step 2: Initialize via RSC (best-effort, does not block chat completion)
+        try:
+            router_state = [
+                "",
+                {"children": ["newtab", {"children": ["__PAGE__", {}, None, None]}, None, None]},
+                None, None, True,
+            ]
+            rsc_headers = {
+                **self._get_headers("/newtab"),
+                "rsc": "1",
+                "next-url": "/newtab",
+                "next-router-state-tree": urllib.parse.quote(json.dumps(router_state)),
+                "Accept": "*/*",
+                "Referer": f"{self.base_url}/newtab",
+            }
+            await self.client.get(
+                f"{self.base_url}/session/{session_id}",
+                headers=rsc_headers,
+                cookies=self._get_cookies(),
+            )
+        except Exception:
+            # 即使 RSC 前端同步请求发生 307 重定向或异常，不影响后端 /api/v1 对话的正常调用
+            pass
         
         return session_id
 
