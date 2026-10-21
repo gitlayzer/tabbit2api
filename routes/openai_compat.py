@@ -583,10 +583,10 @@ async def chat_completions(
                     full_text += ed.get("content", "")
                 elif et == "error":
                     error_msg = ed.get("message", str(ed))
-                    logger.warning(f"[DEBUG] V1 error: code={ed.get("code")} msg={error_msg}")
+                    logger.warning(f"[DEBUG] V1 error: code={ed.get('code')} msg={error_msg}")
                 elif et not in ("message_chunk",):
                     logger.info(f"[DEBUG] V1 event: {et} data_keys={list(ed.keys()) if isinstance(ed, dict) else str(ed)[:100]}")
-        logger.info(f"[DEBUG] _do_chat result: full_text_len={len(full_text)} error_msg={error_msg[:200] if error_msg else "None"}")
+        logger.info(f"[DEBUG] _do_chat result: full_text_len={len(full_text)} error_msg={error_msg[:200] if error_msg else 'None'}")
     
     try:
         if is_agent_request:
