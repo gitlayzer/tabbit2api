@@ -174,10 +174,10 @@ Agent (WorkBuddy/Trae/CodeBuddy)
 ## 🐳 Docker
 
 ```bash
-docker compose up -d          # 启动
-docker compose logs -f        # 日志
-docker compose restart        # 重启
-docker compose down && docker compose up -d --build  # 更新
+docker compose up -d          # 启动（默认拉取 latest 镜像）
+docker compose logs -f        # 查看日志
+docker compose restart        # 重启服务
+docker compose pull && docker compose up -d  # 更新至最新镜像
 ```
 
 ## 📄 许可证

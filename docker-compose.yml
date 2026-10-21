@@ -1,6 +1,9 @@
 services:
   tabbit2api:
-    build: .
+    image: ghcr.io/gitlayzer/tabbit2api:latest
+    pull_policy: always
+    # 如需本地构建可解除下行注释:
+    # build: .
     container_name: tabbit2api
     restart: unless-stopped
     ports:
