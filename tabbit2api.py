@@ -49,8 +49,7 @@ async def lifespan(app: FastAPI):
             if token_str:
                 new_models = await fetch_model_map(token_str)
                 if new_models:
-                    tabbit_client.MODEL_MAP.clear()
-                    tabbit_client.MODEL_MAP.update(new_models)
+                    update_model_map(new_models)
                     logger.info(f"Updated model map with {len(new_models)} models from Tabbit API on startup")
     except Exception as e:
         logger.error(f"Failed to update model map on startup: {e}")
@@ -65,8 +64,7 @@ async def lifespan(app: FastAPI):
                     if token_str:
                         new_models = await fetch_model_map(token_str)
                         if new_models:
-                            tabbit_client.MODEL_MAP.clear()
-                            tabbit_client.MODEL_MAP.update(new_models)
+                            update_model_map(new_models)
                             logger.info(f"Updated model map with {len(new_models)} models from Tabbit API")
             except Exception as e:
                 logger.error(f"Failed to update model map: {e}")

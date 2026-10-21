@@ -41,12 +41,12 @@ async def fetch_model_map(token_str: str) -> dict:
     logger = logging.getLogger("tabbit2openai")
     client = TabbitClient(token_str)
     try:
-        # 直接访问模型配置接口，无需创建会话
+        # 直接访问模型配置接口，获取文本对话模型列表
         url = f"{client.base_url}/proxy/v1/model_config/models"
         logger.info(f"Fetching models from: {url}")
         resp = await client.client.get(
             url,
-            params={"a": "0", "scene": "generate_image"},
+            params={"a": "0"},
             headers=client._get_headers("/proxy/v1/model_config/models"),
             cookies=client._get_cookies(),
         )
@@ -56,7 +56,36 @@ async def fetch_model_map(token_str: str) -> dict:
             return {}
         data = resp.json()
         models = {}
-        name_to_id = {'默认': 'best', 'Kimi-K3': 'kimi-k3', 'LongCat-2.0': 'longcat-2-0', 'GLM-5.2': 'glm-5-2', 'Qwen3.7-Max': 'qwen3-7-max', 'Kimi-K2.7-Code': 'kimi-k2-7-code', 'DeepSeek-V4-Pro': 'deepseek-v4-pro', 'DeepSeek-V4-Flash': 'deepseek-v4-flash', 'Doubao-Seed-2.1-Pro': 'doubao-seed-2-1-pro', 'Doubao-Seed-2.1-Turbo': 'doubao-seed-2-1-turbo', 'MiniMax-M3': 'minimax-m3', 'GLM-5.1': 'glm-5-1', 'GLM-5V-Turbo': 'glm-5v-turbo', 'Kimi-K2.6': 'kimi-k2-6', 'Kimi-K2.5': 'kimi-k2-5', 'MiniMax-M2.7': 'minimax-m2-7', 'Doubao-Seed-2.0-lite': 'doubao-seed-2-0-lite', 'Qwen3.5-Plus': 'qwen3-5-plus', 'LongCat-Flash-Chat': 'longcat-flash-chat', 'LongCat-Flash-Thinking': 'longcat-flash-thinking'}
+        name_to_id = {
+            '默认': 'best',
+            'Default': 'best',
+            'Kimi-K3': 'kimi-k3',
+            'LongCat-2.0': 'longcat-2-0',
+            'GLM-5.3': 'glm-5-3',
+            'GLM-5.3-Flash': 'glm-5-3-flash',
+            'GLM-5.3-FlashX': 'glm-5-3-flashx',
+            'GLM-5.2': 'glm-5-2',
+            'Qwen3.8-Max': 'qwen3-8-max',
+            'Qwen3.7-Max': 'qwen3-7-max',
+            'MiMo-V2.6-Pro': 'mimo-v2-6-pro',
+            'MiMo-V2.6-Flash': 'mimo-v2-6-flash',
+            'Kimi-K2.7-Code': 'kimi-k2-7-code',
+            'DeepSeek-V4.1-Flash': 'deepseek-v4-1-flash',
+            'DeepSeek-V4-Pro': 'deepseek-v4-pro',
+            'DeepSeek-V4-Flash': 'deepseek-v4-flash',
+            'Doubao-Seed-2.1-Pro': 'doubao-seed-2-1-pro',
+            'Doubao-Seed-2.1-Turbo': 'doubao-seed-2-1-turbo',
+            'MiniMax-M3': 'minimax-m3',
+            'GLM-5.1': 'glm-5-1',
+            'GLM-5V-Turbo': 'glm-5v-turbo',
+            'Kimi-K2.6': 'kimi-k2-6',
+            'Kimi-K2.5': 'kimi-k2-5',
+            'MiniMax-M2.7': 'minimax-m2-7',
+            'Doubao-Seed-2.0-lite': 'doubao-seed-2-0-lite',
+            'Qwen3.5-Plus': 'qwen3-5-plus',
+            'LongCat-Flash-Chat': 'longcat-flash-chat',
+            'LongCat-Flash-Thinking': 'longcat-flash-thinking'
+        }
         for item in data.get("models", []):
             display_name = item.get("display_name", "")
             if display_name:
@@ -75,9 +104,8 @@ async def fetch_model_map(token_str: str) -> dict:
 def update_model_map(new_models: dict):
     """Update the global MODEL_MAP with new models from Tabbit API."""
     global MODEL_MAP
-    # Clear and update to ensure all references see the changes
-    MODEL_MAP.clear()
-    MODEL_MAP.update(new_models)
+    if new_models:
+        MODEL_MAP.update(new_models)
 
 
 class TabbitClient:
