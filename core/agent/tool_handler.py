@@ -1,12 +1,10 @@
 """
 Tool Handler — function calling / tool use support for OpenAI and Claude APIs.
 
-Default: disabled. Enable via config: {"agent": {"tools": {"enabled": true}}}
-
 Implements:
-- Soft tool calling: intercept tool definitions, return tool_use, wait for tool_result
-- Tool call loop: assistant → tool_use → user/tool_result → assistant chain
-- Same room_id guarantee for tool chains
+- Soft tool calling: inject tool schema and convert model output into standard tool_calls
+- Multi-turn conversation formatter preserving full context and tool results
+- Standard streaming & non-streaming responses for Agent desktop clients (ZCode, WorkBuddy, Claude, Trae)
 """
 
 import json
@@ -15,7 +13,7 @@ import re
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger("tabbit2agent.tools")
 
@@ -43,19 +41,29 @@ _tool_chains: Dict[str, ToolCallChain] = {}
 
 # ── Tool definition parser ──
 
-def parse_openai_tools(tools: List[dict]) -> List[dict]:
+def parse_openai_tools(tools: List[Any]) -> List[dict]:
     """Parse OpenAI tools array into a normalized format."""
     if not tools:
         return []
     result = []
     for t in tools:
-        if t.get("type") == "function":
-            func = t.get("function", {})
-            result.append({
-                "name": func.get("name", ""),
-                "description": func.get("description", ""),
-                "parameters": func.get("parameters", {}),
-            })
+        if isinstance(t, dict):
+            if t.get("type") == "function":
+                func = t.get("function", {})
+                result.append({
+                    "name": func.get("name", ""),
+                    "description": func.get("description", ""),
+                    "parameters": func.get("parameters", {}),
+                })
+        else:
+            t_type = getattr(t, "type", "")
+            func = getattr(t, "function", None)
+            if t_type == "function" and func:
+                result.append({
+                    "name": getattr(func, "name", ""),
+                    "description": getattr(func, "description", ""),
+                    "parameters": getattr(func, "parameters", {}),
+                })
     return result
 
 
@@ -74,10 +82,8 @@ def parse_claude_tools(tools: List[dict]) -> List[dict]:
 
 
 def build_tool_prompt(tools: List[dict]) -> str:
-    """Build a tool-calling prompt to inject into the Tabbit message.
-
-    This is a 'soft tool call' approach: we tell the model what tools are
-    available and expect it to respond with <tool_call> XML blocks.
+    """Build an authoritative tool-calling prompt to inject into the model context.
+    Instructs the model to output strict <tool_call> XML format when invoking tools.
     """
     if not tools:
         return ""
@@ -88,18 +94,23 @@ def build_tool_prompt(tools: List[dict]) -> str:
         desc = t.get("description", "")
         params = json.dumps(t.get("parameters", {}), ensure_ascii=False)
         tool_descriptions.append(
-            f"- {name}: {desc}\n  Parameters: {params}"
+            f"### Tool: {name}\n- Description: {desc}\n- Parameters Schema: {params}"
         )
 
     prompt = (
-        "You have access to the following tools:\n\n"
-        + "\n".join(tool_descriptions)
+        "【CRITICAL SYSTEM INSTRUCTION: TOOLS AVAILABLE】\n"
+        "You have access to the following local environment tools to read/write files, execute terminal commands, or interact with the user's workspace:\n\n"
+        + "\n\n".join(tool_descriptions)
         + "\n\n"
-        "To use a tool, respond with exactly:\n"
-        '<tool_call>\n'
-        '{"name": "<tool_name>", "arguments": <json_args>}\n'
-        '</tool_call>\n'
-        "After receiving the tool result, continue the conversation naturally."
+        "IMPORTANT RULES FOR TOOL INVOCATION:\n"
+        "1. When you need to inspect files, run terminal commands, or execute tasks on the user's computer, you MUST output a tool call block.\n"
+        "2. Do NOT pretend or fabricate that you have executed commands without calling the tool.\n"
+        "3. To invoke a tool, you MUST output strictly formatted XML like this:\n"
+        "<tool_call>\n"
+        '{"name": "<tool_name>", "arguments": {<arguments_json_object>}}\n'
+        "</tool_call>\n"
+        "4. You can provide brief explanations before the tool call. Once outputting <tool_call>, the system will execute it and give you the result.\n"
+        "5. After receiving the tool result, continue the task."
     )
     return prompt
 
@@ -107,54 +118,117 @@ def build_tool_prompt(tools: List[dict]) -> str:
 # ── Tool call detection ──
 
 TOOL_CALL_PATTERN = re.compile(
-    r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL
+    r"<tool_call>\s*([\s\S]*?)\s*</tool_call>", re.DOTALL | re.IGNORECASE
 )
 
 
 def detect_tool_call(text: str) -> Optional[ToolCall]:
-    """Detect if the model output contains a tool call."""
-    match = TOOL_CALL_PATTERN.search(text)
-    if not match:
-        return None
-    try:
-        data = json.loads(match.group(1))
-        return ToolCall(
-            id=f"call_{uuid.uuid4().hex[:8]}",
-            name=data.get("name", ""),
-            arguments=data.get("arguments", {}),
-        )
-    except json.JSONDecodeError:
-        return None
+    """Detect single tool call (backward compatibility)."""
+    _, calls = detect_all_tool_calls(text)
+    return calls[0] if calls else None
 
 
-# ── Tool call chain management ──
+def detect_all_tool_calls(text: str) -> Tuple[str, List[ToolCall]]:
+    """Detect all <tool_call> blocks in text, return (clean_text, [ToolCall, ...]).
+    Also supports fallback code block format like ```json {"tool": "...", "parameters": {...}} ```.
+    """
+    tool_calls = []
+    clean_text = text
+    matches = list(TOOL_CALL_PATTERN.finditer(text))
 
-def get_tool_chain(room_id: str) -> Optional[ToolCallChain]:
-    """Get the tool call chain for a room."""
-    return _tool_chains.get(room_id)
+    if matches:
+        clean_text = TOOL_CALL_PATTERN.sub("", text).strip()
+        for m in matches:
+            raw_json = m.group(1).strip()
+            # Strip markdown code blocks if wrapped inside
+            raw_json = re.sub(r"^```(?:json)?\s*", "", raw_json)
+            raw_json = re.sub(r"\s*```$", "", raw_json)
+            try:
+                data = json.loads(raw_json)
+                fn_name = data.get("name") or data.get("tool") or data.get("function") or ""
+                fn_args = data.get("arguments") or data.get("parameters") or data.get("args") or {}
+                if isinstance(fn_args, str):
+                    try:
+                        fn_args = json.loads(fn_args)
+                    except Exception:
+                        pass
+                if fn_name:
+                    tool_calls.append(ToolCall(
+                        id=f"call_{uuid.uuid4().hex[:12]}",
+                        name=fn_name,
+                        arguments=fn_args if isinstance(fn_args, dict) else {"input": fn_args},
+                    ))
+            except Exception as e:
+                logger.warning(f"Error parsing tool call JSON: {e}, raw: {raw_json[:120]}")
+
+    return clean_text, tool_calls
 
 
-def start_tool_chain(room_id: str) -> ToolCallChain:
-    """Start a new tool call chain."""
-    chain = ToolCallChain(room_id=room_id)
-    _tool_chains[room_id] = chain
-    return chain
+# ── Full Multi-Turn Chat Formatter (No Aggressive Truncation) ──
+
+def format_chat_messages(messages: List[Any]) -> str:
+    """Format full multi-turn chat messages into structured conversation text.
+    Preserves all user, assistant, system instructions, and tool execution results
+    without aggressive 500-char truncation, ensuring seamless Agent loop performance.
+    """
+    if not messages:
+        return ""
+
+    formatted_parts = []
+
+    for msg in messages:
+        if isinstance(msg, dict):
+            role = msg.get("role", "user")
+            content = msg.get("content", "")
+            tool_calls = msg.get("tool_calls")
+            tool_call_id = msg.get("tool_call_id")
+        else:
+            role = getattr(msg, "role", "user")
+            content = getattr(msg, "content", "")
+            tool_calls = getattr(msg, "tool_calls", None)
+            tool_call_id = getattr(msg, "tool_call_id", None)
+
+        # Normalize content to string
+        if isinstance(content, list):
+            text_items = []
+            for item in content:
+                if isinstance(item, dict):
+                    if item.get("type") == "text":
+                        text_items.append(item.get("text", ""))
+                    elif item.get("type") == "tool_result":
+                        text_items.append(str(item.get("content", "")))
+                else:
+                    text_items.append(str(item))
+            content_str = "\n".join(text_items)
+        else:
+            content_str = str(content or "")
+
+        if role == "system":
+            # Preserve system instructions
+            if content_str.strip():
+                formatted_parts.append(f"[System Instruction]:\n{content_str}")
+        elif role == "user":
+            formatted_parts.append(f"[User]:\n{content_str}")
+        elif role == "assistant":
+            # If previous assistant executed tool calls, format them for model context
+            if tool_calls:
+                call_descs = []
+                for tc in tool_calls:
+                    fn = tc.get("function", {}) if isinstance(tc, dict) else getattr(tc, "function", {})
+                    name = fn.get("name", "") if isinstance(fn, dict) else getattr(fn, "name", "")
+                    args = fn.get("arguments", "") if isinstance(fn, dict) else getattr(fn, "arguments", "")
+                    call_descs.append(f"{name}({args})")
+                formatted_parts.append(f"[Assistant Invoked Tools]: {', '.join(call_descs)}")
+            if content_str.strip():
+                formatted_parts.append(f"[Assistant]:\n{content_str}")
+        elif role == "tool":
+            call_id_tag = f" ({tool_call_id})" if tool_call_id else ""
+            formatted_parts.append(f"[Tool Execution Result{call_id_tag}]:\n{content_str}")
+
+    return "\n\n".join(formatted_parts)
 
 
-def add_tool_call(room_id: str, call: ToolCall):
-    """Add a tool call to the chain."""
-    chain = _tool_chains.get(room_id)
-    if not chain:
-        chain = start_tool_chain(room_id)
-    chain.tool_calls.append(call)
-
-
-def clear_tool_chain(room_id: str):
-    """Clear a tool call chain."""
-    _tool_chains.pop(room_id, None)
-
-
-# ── OpenAI tool call response builder ──
+# ── OpenAI Tool Call Responses ──
 
 def build_openai_tool_response(
     completion_id: str,
@@ -177,7 +251,7 @@ def build_openai_tool_response(
                     "type": "function",
                     "function": {
                         "name": tool_call.name,
-                        "arguments": json.dumps(tool_call.arguments, ensure_ascii=False),
+                        "arguments": json.dumps(tool_call.arguments, ensure_ascii=False) if isinstance(tool_call.arguments, dict) else str(tool_call.arguments),
                     },
                 }],
             },
@@ -186,40 +260,135 @@ def build_openai_tool_response(
     }
 
 
-# ── Claude tool use response builder ──
-
-def build_claude_tool_response(
-    request_id: str,
+def build_openai_tool_stream_chunks(
+    completion_id: str,
     model: str,
-    tool_call: ToolCall,
+    tool_calls: List[ToolCall],
+    content: str = "",
+) -> List[str]:
+    """Build a list of SSE chunks delivering tool_calls to OpenAI-compatible clients."""
+    chunks = []
+
+    # If there is preceding reasoning or commentary, output it first
+    if content:
+        c_chunk = {
+            "id": completion_id,
+            "object": "chat.completion.chunk",
+            "created": int(time.time()),
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "delta": {"role": "assistant", "content": content},
+                "finish_reason": None,
+            }],
+        }
+        chunks.append(f"data: {json.dumps(c_chunk, ensure_ascii=False)}\n\n")
+
+    # Output tool_calls delta
+    serialized_tools = []
+    for idx, tc in enumerate(tool_calls):
+        args_str = json.dumps(tc.arguments, ensure_ascii=False) if isinstance(tc.arguments, dict) else str(tc.arguments)
+        serialized_tools.append({
+            "index": idx,
+            "id": tc.id,
+            "type": "function",
+            "function": {
+                "name": tc.name,
+                "arguments": args_str,
+            },
+        })
+
+    t_chunk = {
+        "id": completion_id,
+        "object": "chat.completion.chunk",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "delta": {"role": "assistant", "tool_calls": serialized_tools},
+            "finish_reason": None,
+        }],
+    }
+    chunks.append(f"data: {json.dumps(t_chunk, ensure_ascii=False)}\n\n")
+
+    # Final finish chunk with finish_reason: "tool_calls"
+    finish_chunk = {
+        "id": completion_id,
+        "object": "chat.completion.chunk",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "delta": {},
+            "finish_reason": "tool_calls",
+        }],
+    }
+    chunks.append(f"data: {json.dumps(finish_chunk, ensure_ascii=False)}\n\n")
+    chunks.append("data: [DONE]\n\n")
+    return chunks
+
+
+def build_openai_tool_completion(
+    completion_id: str,
+    model: str,
+    tool_calls: List[ToolCall],
+    content: str = "",
     input_tokens: int = 0,
-) -> str:
-    """Build a Claude-compatible tool_use SSE event."""
-    event = {
-        "type": "content_block_start",
-        "index": 0,
-        "content_block": {
-            "type": "tool_use",
-            "id": tool_call.id,
-            "name": tool_call.name,
-            "input": tool_call.arguments,
+    output_tokens: int = 0,
+) -> dict:
+    """Build a non-streaming OpenAI chat.completion response with tool_calls."""
+    serialized_calls = []
+    for tc in tool_calls:
+        args_str = json.dumps(tc.arguments, ensure_ascii=False) if isinstance(tc.arguments, dict) else str(tc.arguments)
+        serialized_calls.append({
+            "id": tc.id,
+            "type": "function",
+            "function": {
+                "name": tc.name,
+                "arguments": args_str,
+            },
+        })
+
+    return {
+        "id": completion_id,
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": content if content else None,
+                "tool_calls": serialized_calls,
+            },
+            "finish_reason": "tool_calls",
+        }],
+        "usage": {
+            "prompt_tokens": input_tokens,
+            "completion_tokens": output_tokens,
+            "total_tokens": input_tokens + output_tokens,
         },
     }
-    return f"event: content_block_start\ndata: {json.dumps(event)}\n\n"
 
 
-# ── Tool result merger ──
+# ── Tool chain utilities ──
 
-def merge_tool_results(
-    messages: List[dict],
-    tool_result_role: str = "tool",
-) -> str:
-    """Merge tool results from messages into a context string for the model."""
-    parts = []
-    for msg in messages:
-        role = msg.get("role", "")
-        if role == tool_result_role:
-            content = str(msg.get("content", ""))
-            call_id = msg.get("tool_call_id", "unknown")
-            parts.append(f"[Tool Result {call_id}]: {content}")
-    return "\n".join(parts)
+def get_tool_chain(room_id: str) -> Optional[ToolCallChain]:
+    return _tool_chains.get(room_id)
+
+
+def start_tool_chain(room_id: str) -> ToolCallChain:
+    chain = ToolCallChain(room_id=room_id)
+    _tool_chains[room_id] = chain
+    return chain
+
+
+def add_tool_call(room_id: str, call: ToolCall):
+    chain = _tool_chains.get(room_id)
+    if not chain:
+        chain = start_tool_chain(room_id)
+    chain.tool_calls.append(call)
+
+
+def clear_tool_chain(room_id: str):
+    _tool_chains.pop(room_id, None)

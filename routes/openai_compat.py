@@ -21,7 +21,10 @@ from core.agent.context_manager import SlidingWindow, ContextCompressor, estimat
 from core.agent.agent_router import ModelSelector
 from core.agent.tool_handler import (
     parse_openai_tools, build_tool_prompt, detect_tool_call,
+    detect_all_tool_calls, format_chat_messages,
+    build_openai_tool_stream_chunks, build_openai_tool_completion,
     build_openai_tool_response, add_tool_call, get_tool_chain, clear_tool_chain,
+    ToolCall,
 )
 
 logger = logging.getLogger("tabbit2openai")
@@ -210,42 +213,31 @@ def init(token_manager: TokenManager, config: ConfigManager, log_store: LogStore
 import re
 
 def _clean_text(text: str) -> str:
-    text = re.sub(r'<system-reminder>.*?</system-reminder>', '', text, flags=re.DOTALL)
-    text = re.sub(r'<user_input>.*?</user_input>', '', text, flags=re.DOTALL)
-    text = re.sub(r'<env>.*?</env>', '', text, flags=re.DOTALL)
-    text = re.sub(r'<task_list>.*?</task_list>', '', text, flags=re.DOTALL)
-    text = re.sub(r'<tool_list>.*?</tool_list>', '', text, flags=re.DOTALL)
-    text = re.sub(r'<tool_call>.*?</tool_call>', '', text, flags=re.DOTALL)
-    text = re.sub(r'<tool_result>.*?</tool_result>', '', text, flags=re.DOTALL)
-    text = re.sub(r'<function_calls>.*?</function_calls>', '', text, flags=re.DOTALL)
-    text = re.sub(r'<task_type>.*?</task_type>', '', text, flags=re.DOTALL)
-    text = re.sub(r'<goal>.*?</goal>', '', text, flags=re.DOTALL)
-    text = re.sub(r'<thought>.*?</thought>', '', text, flags=re.DOTALL)
-    text = re.sub(r'<content>.*?</content>', '', text, flags=re.DOTALL)
-    
-    text = re.sub(r'<[^>]+>', '', text)
-    text = re.sub(r'\n+', '\n', text)
-    text = re.sub(r'^\s+|\s+$', '', text)
-    
-    return text
+    if not text:
+        return ""
+    return str(text).strip()
 
 def _normalize_content(content) -> str:
+    if content is None:
+        return ""
     if isinstance(content, str):
-        return _clean_text(content)
+        return content.strip()
     elif isinstance(content, list):
-        result = ""
+        result = []
         for item in content:
             if isinstance(item, dict):
                 if item.get("type") == "text":
-                    result += _clean_text(item.get("text", ""))
+                    result.append(item.get("text", ""))
                 elif item.get("type") == "image_url":
-                    result += f"[Image: {item.get('image_url', {}).get('url', '')}]"
+                    result.append(f"[Image: {item.get('image_url', {}).get('url', '')}]")
+                elif item.get("type") == "tool_result":
+                    result.append(str(item.get("content", "")))
                 else:
-                    result += _clean_text(str(item.get("content", "")))
+                    result.append(str(item.get("content", "")))
             else:
-                result += _clean_text(str(item))
-        return result.strip()
-    return _clean_text(str(content))
+                result.append(str(item))
+        return "\n".join(result).strip()
+    return str(content).strip()
 
 
 class ChatMessageContentPart(BaseModel):
@@ -256,7 +248,10 @@ class ChatMessageContentPart(BaseModel):
 
 class ChatMessage(BaseModel):
     role: str
-    content: str | List[ChatMessageContentPart]
+    content: Optional[Any] = ""
+    name: Optional[str] = None
+    tool_calls: Optional[List[Any]] = None
+    tool_call_id: Optional[str] = None
 
 
 class ToolChoice(BaseModel):
@@ -277,13 +272,13 @@ class ChatCompletionRequest(BaseModel):
     temperature: Optional[float] = None
     top_p: Optional[float] = None
     n: Optional[int] = 1
-    stop: Optional[List[str]] = None
+    stop: Optional[Any] = None
     presence_penalty: Optional[float] = None
     frequency_penalty: Optional[float] = None
     logit_bias: Optional[Dict[str, float]] = None
     user: Optional[str] = None
-    tools: Optional[List[Tool]] = None
-    tool_choice: Optional[Any] = None  # "auto", "none", {"type":"function","function":{"name":"xxx"}}
+    tools: Optional[List[Any]] = None
+    tool_choice: Optional[Any] = None
 
 
 class SimpleChatRequest(BaseModel):
@@ -380,42 +375,68 @@ def _is_premium_model(model_id: str) -> bool:
     return _get_model_access_type(model_id) == "premium_only"
 
 
-async def _stream_handler(client, session_id, content, tabbit_model, req_model, completion_id, token_name, token_id, use_v3=False):
+async def _stream_handler(
+    client, session_id, content, tabbit_model, req_model,
+    completion_id, token_name, token_id, use_v3=False, has_tools=False
+):
     start = time.time()
     error_msg = ""
+    buffered_text = ""
     try:
-        yield f"data: {json.dumps({'id': completion_id, 'object': 'chat.completion.chunk', 'choices': [{'index': 0, 'delta': {'role': 'assistant', 'content': ''}, 'finish_reason': None}]})}\n\n"
+        if not has_tools:
+            yield f"data: {json.dumps({'id': completion_id, 'object': 'chat.completion.chunk', 'choices': [{'index': 0, 'delta': {'role': 'assistant', 'content': ''}, 'finish_reason': None}]})}\n\n"
 
-        if use_v3:
-            async for event in client.send_message_v3(session_id, content, tabbit_model):
-                et, ed = event["event"], event["data"]
-                if et == "error":
-                    error_msg = ed.get("message", str(ed))
-                    yield f"data: {json.dumps({'id': completion_id, 'object': 'chat.completion.chunk', 'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'stop'}]})}\n\n"
-                    yield "data: [DONE]\n\n"
-                    return
-                if et == "message_chunk":
-                    if "content" in ed:
-                        chunk = {
-                            "id": completion_id,
-                            "object": "chat.completion.chunk",
-                            "choices": [{"index": 0, "delta": {"content": ed["content"]}, "finish_reason": None}],
-                        }
-                        yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
-                elif et == "finish":
-                    yield f"data: {json.dumps({'id': completion_id, 'object': 'chat.completion.chunk', 'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'stop'}]})}\n\n"
-        else:
-            async for event in client.send_message(session_id, content, tabbit_model):
-                et, ed = event["event"], event["data"]
-                if et == "message_chunk" and "content" in ed:
+        async def _iterate_events():
+            if use_v3:
+                async for event in client.send_message_v3(session_id, content, tabbit_model):
+                    yield event
+            else:
+                async for event in client.send_message(session_id, content, tabbit_model):
+                    yield event
+
+        async for event in _iterate_events():
+            et, ed = event["event"], event["data"]
+            if et == "error":
+                error_msg = ed.get("message", str(ed))
+                yield f"data: {json.dumps({'id': completion_id, 'object': 'chat.completion.chunk', 'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'stop'}]})}\n\n"
+                yield "data: [DONE]\n\n"
+                return
+            if et == "message_chunk" and "content" in ed:
+                chunk_piece = ed["content"]
+                if has_tools:
+                    buffered_text += chunk_piece
+                else:
                     chunk = {
                         "id": completion_id,
                         "object": "chat.completion.chunk",
-                        "choices": [{"index": 0, "delta": {"content": ed["content"]}, "finish_reason": None}],
+                        "choices": [{"index": 0, "delta": {"content": chunk_piece}, "finish_reason": None}],
                     }
                     yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
-                elif et in ("message_finish", "finish"):
+            elif et in ("message_finish", "finish"):
+                if not has_tools:
                     yield f"data: {json.dumps({'id': completion_id, 'object': 'chat.completion.chunk', 'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'stop'}]})}\n\n"
+
+        if has_tools:
+            clean_text, tool_calls = detect_all_tool_calls(buffered_text)
+            if tool_calls:
+                chunks = build_openai_tool_stream_chunks(
+                    completion_id=completion_id,
+                    model=req_model,
+                    tool_calls=tool_calls,
+                    content=clean_text,
+                )
+                for c in chunks:
+                    yield c
+                return
+            else:
+                if clean_text:
+                    chunk_text = {
+                        "id": completion_id,
+                        "object": "chat.completion.chunk",
+                        "choices": [{"index": 0, "delta": {"role": "assistant", "content": clean_text}, "finish_reason": None}],
+                    }
+                    yield f"data: {json.dumps(chunk_text, ensure_ascii=False)}\n\n"
+                yield f"data: {json.dumps({'id': completion_id, 'object': 'chat.completion.chunk', 'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'stop'}]})}\n\n"
 
         yield "data: [DONE]\n\n"
         if token_id:
@@ -450,6 +471,8 @@ async def chat_completions(
             model_id = "best"
             tabbit_model = "最佳"
             content = _normalize_content(req.content)
+            has_tools = False
+            is_agent_request = False
         else:
             model_id = (req.model or _cfg.get("openai", "default_model", default="best")).lower() if _cfg else (req.model or "best").lower()
             
@@ -461,88 +484,55 @@ async def chat_completions(
             
             tabbit_model = tabbit_client.MODEL_MAP.get(model_id, model_id)
             
-            # Agent message cleaner
-            if agent_config.get("cleaner", {}).get("enabled", False):
-                bearer = _extract_bearer_token(authorization) if authorization else ""
-                # Use per-request session key to avoid stale dedup cache
-                dedup_key = f"{bearer}:{model_id}:{int(time.time())}"
-                content = build_agent_content(
-                    [{"role": m.role, "content": _normalize_content(m.content)} for m in req.messages],
-                    dedup_session=dedup_key,
-                )
-            else:
-                # Legacy content building (kept for backward compatibility)
-                import re as _re
-                last_user = ""
-                for m in reversed(req.messages):
-                    if m.role == "user":
-                        raw_str = m.content if isinstance(m.content, str) else str(m.content)
-                        # IMPORTANT: extract <user_query> BEFORE _clean_text() strips XML tags
-                        match = _re.search(r'<user_query>(.*?)</user_query>', raw_str, _re.DOTALL)
-                        if match:
-                            last_user = match.group(1).strip()
-                        else:
-                            raw = _normalize_content(m.content)
-                            if len(raw) > 2000:
-                                lines = raw.strip().split('\n')
-                                meaningful = []
-                                for line in reversed(lines):
-                                    line = line.strip()
-                                    if not line:
-                                        continue
-                                    if len(line) > 200 or line.startswith(('OS Version:', 'Shell:', 'Workspace:', 'Current date:', '<system-reminder', '</system-reminder>', '```')):
-                                        continue
-                                    meaningful.insert(0, line)
-                                    if len('\n'.join(meaningful)) > 500:
-                                        break
-                                last_user = '\n'.join(meaningful) if meaningful else raw[-500:]
-                            else:
-                                last_user = raw
-                        break
-                system_msgs = []
-                for m in req.messages:
-                    if m.role == "system":
-                        content_str = _normalize_content(m.content)
-                        if 'isNewTopic' in content_str or 'Generate a concise' in content_str or 'sentence-case title' in content_str or 'Respond with EXACTLY one JSON object' in content_str:
-                            continue
-                        if len(content_str) > 2000:
-                            continue
-                        system_msgs.append(content_str)
-                if system_msgs:
-                    content = "\n\n".join(system_msgs) + "\n\n" + last_user
-                else:
-                    content = last_user
-            
-            # Tool calling: inject tool prompt if tools are present
-            if not isinstance(req, SimpleChatRequest) and req.tools and agent_config.get("tools", {}).get("enabled", False):
-                tools_parsed = parse_openai_tools([t.model_dump() for t in req.tools])
+            has_tools = bool(req.tools)
+            is_agent_request = has_tools or any(
+                getattr(m, "role", "") in ("tool", "system") for m in req.messages
+            ) or len(req.messages) > 2
+
+            # Multi-turn conversation formatter preserving full context and tool results
+            formatted_content = format_chat_messages(req.messages)
+
+            # Tool calling: inject authoritative instructions when tools are present
+            if has_tools:
+                tools_parsed = parse_openai_tools(req.tools)
                 tool_prompt = build_tool_prompt(tools_parsed)
                 if tool_prompt:
-                    content = tool_prompt + "\n\n" + content
+                    content = tool_prompt + "\n\n" + formatted_content
+                else:
+                    content = formatted_content
+            else:
+                content = formatted_content
+            
             logger.info(f"[DEBUG] Final content ({len(content)} chars): {content[:300]}")
     except Exception as e:
+        logger.error(f"Error preparing chat request: {e}", exc_info=True)
         raise HTTPException(status_code=400, detail="Invalid request format")
     
     use_v3 = _is_premium_model(model_id)
-    is_stream = getattr(req, 'stream', False)
+    is_stream = getattr(req, "stream", False)
     
-    # Session cache: reuse session for same API key + model
+    # Session handling:
+    # For agent requests (tools / multi-turn tool chains), use an isolated session to prevent
+    # concurrency lock bottlenecks and Tabbit 409 Conflict.
     bearer = _extract_bearer_token(authorization) if authorization else ""
-    cached_session = _get_cached_session(bearer, model_id)
-    
+    cached_session = None
+    if not is_agent_request:
+        cached_session = _get_cached_session(bearer, model_id)
+
     if cached_session:
         session_id = cached_session
         logger.info(f"Reusing cached session {session_id} for model {model_id}")
     else:
         try:
             session_id = await client.create_chat_session()
-            _cache_session(bearer, model_id, session_id, use_v3)
-            logger.info(f"Created new session {session_id} for model {model_id}")
+            if not is_agent_request:
+                _cache_session(bearer, model_id, session_id, use_v3)
+            logger.info(f"Created new session {session_id} for model {model_id} (agent={is_agent_request})")
         except Exception as e:
             if token_id:
                 _tm.report_error(token_id)
             _logs.add(LogEntry(
-                model=getattr(req, 'model', 'unknown'), token_name=token_name,
+                model=getattr(req, "model", "unknown"), token_name=token_name,
                 stream=is_stream, status="error", error=str(e)
             ))
             raise HTTPException(status_code=502, detail=f"Failed to create chat session: {e}")
@@ -550,16 +540,25 @@ async def chat_completions(
     completion_id = f"chatcmpl-{uuid.uuid4().hex}"
     
     if is_stream:
-        # Serialize concurrent requests to same session via async lock
-        lock = _get_session_lock(session_id)
-        async def locked_stream():
-            async with lock:
-                async for chunk in _stream_handler(
-                    client, session_id, content, tabbit_model, getattr(req, 'model', 'unknown'),
-                    completion_id, token_name, token_id, use_v3=use_v3
-                ):
-                    yield chunk
-        return StreamingResponse(locked_stream(), media_type="text/event-stream")
+        if is_agent_request:
+            # Isolated session, stream directly without global lock contention
+            return StreamingResponse(
+                _stream_handler(
+                    client, session_id, content, tabbit_model, getattr(req, "model", "unknown"),
+                    completion_id, token_name, token_id, use_v3=use_v3, has_tools=has_tools
+                ),
+                media_type="text/event-stream"
+            )
+        else:
+            lock = _get_session_lock(session_id)
+            async def locked_stream():
+                async with lock:
+                    async for chunk in _stream_handler(
+                        client, session_id, content, tabbit_model, getattr(req, "model", "unknown"),
+                        completion_id, token_name, token_id, use_v3=use_v3, has_tools=has_tools
+                    ):
+                        yield chunk
+            return StreamingResponse(locked_stream(), media_type="text/event-stream")
     
     start = time.time()
     full_text = ""
@@ -584,28 +583,30 @@ async def chat_completions(
                     full_text += ed.get("content", "")
                 elif et == "error":
                     error_msg = ed.get("message", str(ed))
-                    logger.warning(f"[DEBUG] V1 error: code={ed.get('code')} msg={error_msg}")
+                    logger.warning(f"[DEBUG] V1 error: code={ed.get("code")} msg={error_msg}")
                 elif et not in ("message_chunk",):
                     logger.info(f"[DEBUG] V1 event: {et} data_keys={list(ed.keys()) if isinstance(ed, dict) else str(ed)[:100]}")
-        logger.info(f"[DEBUG] _do_chat result: full_text_len={len(full_text)} error_msg={error_msg[:200] if error_msg else 'None'}")
+        logger.info(f"[DEBUG] _do_chat result: full_text_len={len(full_text)} error_msg={error_msg[:200] if error_msg else "None"}")
     
     try:
-        # Serialize requests to the same session to avoid 409 Conflict
-        lock = _get_session_lock(session_id)
-        async with lock:
+        if is_agent_request:
             await _do_chat(session_id)
-        
-        # Auto-retry: if session failed (e.g. expired), create new one
-        if error_msg and cached_session:
-            logger.warning(f"Session {session_id} failed: {error_msg}, retrying with new session")
-            _invalidate_session(bearer, model_id)
-            new_sid = await client.create_chat_session()
-            _cache_session(bearer, model_id, new_sid, use_v3)
-            full_text = ""
-            error_msg = ""
-            lock2 = _get_session_lock(new_sid)
-            async with lock2:
-                await _do_chat(new_sid)
+        else:
+            lock = _get_session_lock(session_id)
+            async with lock:
+                await _do_chat(session_id)
+            
+            # Auto-retry: if session failed (e.g. expired), create new one
+            if error_msg and cached_session:
+                logger.warning(f"Session {session_id} failed: {error_msg}, retrying with new session")
+                _invalidate_session(bearer, model_id)
+                new_sid = await client.create_chat_session()
+                _cache_session(bearer, model_id, new_sid, use_v3)
+                full_text = ""
+                error_msg = ""
+                lock2 = _get_session_lock(new_sid)
+                async with lock2:
+                    await _do_chat(new_sid)
         
         if token_id and not error_msg:
             _tm.report_success(token_id)
@@ -614,25 +615,38 @@ async def chat_completions(
         if token_id:
             _tm.report_error(token_id)
         _logs.add(LogEntry(
-            model=getattr(req, 'model', 'unknown'), token_name=token_name,
+            model=getattr(req, "model", "unknown"), token_name=token_name,
             stream=False, status="error", error=error_msg
         ))
         raise HTTPException(status_code=502, detail=str(e))
     
     duration = time.time() - start
     _logs.add(LogEntry(
-        model=getattr(req, 'model', 'unknown'), token_name=token_name,
+        model=getattr(req, "model", "unknown"), token_name=token_name,
         stream=False, status="success" if not error_msg else "error", duration=duration, error=error_msg
     ))
 
     input_tokens = len(content) // 4
     output_tokens = len(full_text) // 4
 
+    # Check for tool calls in non-streaming mode
+    if has_tools or "<tool_call>" in full_text:
+        clean_text, tool_calls = detect_all_tool_calls(full_text)
+        if tool_calls:
+            return build_openai_tool_completion(
+                completion_id=completion_id,
+                model=getattr(req, "model", "unknown"),
+                tool_calls=tool_calls,
+                content=clean_text,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+            )
+
     return {
         "id": completion_id,
         "object": "chat.completion",
         "created": int(time.time()),
-        "model": getattr(req, 'model', 'unknown'),
+        "model": getattr(req, "model", "unknown"),
         "choices": [{"index": 0, "message": {"role": "assistant", "content": full_text}, "finish_reason": "stop"}],
         "usage": {
             "prompt_tokens": input_tokens,
