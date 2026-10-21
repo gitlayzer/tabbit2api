@@ -15,12 +15,19 @@ import httpx
 MODEL_MAP = {
     "best": "最佳",
     "kimi-k3": "Kimi-K3",
-    "longcat-2-0": "LongCat-2.0",
-    "glm-5-2": "GLM-5.2",
-    "qwen3-7-max": "Qwen3.7-Max",
-    "kimi-k2-7-code": "Kimi-K2.7-Code",
+    "deepseek-v4.1-flash": "DeepSeek-V4.1-Flash",
+    "deepseek-v4-1-flash": "DeepSeek-V4.1-Flash",
     "deepseek-v4-pro": "DeepSeek-V4-Pro",
     "deepseek-v4-flash": "DeepSeek-V4-Flash",
+    "longcat-2-0": "LongCat-2.0",
+    "glm-5-3": "GLM-5.3",
+    "glm-5-3-flash": "GLM-5.3-Flash",
+    "glm-5-2": "GLM-5.2",
+    "qwen3-8-max": "Qwen3.8-Max",
+    "qwen3-7-max": "Qwen3.7-Max",
+    "kimi-k2-7-code": "Kimi-K2.7-Code",
+    "mimo-v2-6-pro": "MiMo-V2.6-Pro",
+    "mimo-v2-6-flash": "MiMo-V2.6-Flash",
     "doubao-seed-2-1-pro": "Doubao-Seed-2.1-Pro",
     "doubao-seed-2-1-turbo": "Doubao-Seed-2.1-Turbo",
     "minimax-m3": "MiniMax-M3",
@@ -92,6 +99,12 @@ async def fetch_model_map(token_str: str) -> dict:
                 # 使用映射表中的 ID，如果没有则使用 display_name
                 model_id = name_to_id.get(display_name, display_name.lower().replace(" ", "-").replace(".", "-"))
                 models[model_id] = display_name
+                # 兼容点号与破折号两种写法（例如 deepseek-v4.1-flash 与 deepseek-v4-1-flash）
+                if "." in display_name or "-" in display_name:
+                    alt_id = display_name.lower().replace(" ", "-")
+                    models[alt_id] = display_name
+                    alt_id_dash = alt_id.replace(".", "-")
+                    models[alt_id_dash] = display_name
         logger.info(f"Found {len(models)} models from Tabbit API")
         return models
     except Exception as e:

@@ -52,6 +52,7 @@ docker compose up -d
 |---------|------|------|------|
 | `best` | 最佳 | 免费 | 默认模式，不消耗用量 |
 | `kimi-k3` | Kimi-K3 | **PRO** | Kimi 最强旗舰，1M 上下文 |
+| `deepseek-v4.1-flash` | DeepSeek-V4.1-Flash | 免费 | DeepSeek 最新原生多模态 1M 上下文旗舰 |
 | `longcat-2-0` | LongCat-2.0 | 免费 | 美团最新旗舰，1M 上下文 |
 | `glm-5-2` | GLM-5.2 | 免费 | 智谱最新文本模型 |
 | `qwen3-7-max` | Qwen3.7-Max | 免费 | 阿里千问旗舰文本 |
