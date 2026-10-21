@@ -13,6 +13,10 @@ services:
     environment:
       - TZ=Asia/Shanghai
       - PYTHONUNBUFFERED=1
+      # 在此填入从 Tabbit 网页复制的 Token（支持逗号分隔多个账号）:
+      - TABBIT_TOKEN=${TABBIT_TOKEN:-}
+      # 客户端调用时的全局 API Key（可选，留空则无需鉴权）:
+      - TABBIT_API_KEY=${TABBIT_API_KEY:-}
     networks:
       - tabbit2api_net
     healthcheck:

@@ -3,6 +3,7 @@ import os
 import hashlib
 import secrets
 import copy
+import time
 from pathlib import Path
 
 CONFIG_PATH = Path(__file__).resolve().parent.parent / "config.json"
@@ -55,6 +56,27 @@ def _apply_env_overrides(config: dict) -> dict:
                     pass
             else:
                 d[keys[-1]] = value
+
+    # 支持通过环境变量直接注入 Token (单个或逗号分隔的多个)
+    tabbit_token = os.environ.get("TABBIT_TOKEN")
+    if tabbit_token:
+        tokens_list = config.setdefault("tokens", [])
+        existing_values = {t.get("value") for t in tokens_list if isinstance(t, dict)}
+        for idx, tk in enumerate(tabbit_token.split(",")):
+            tk = tk.strip()
+            if tk and tk not in existing_values:
+                token_id = f"env-{idx + 1}"
+                tokens_list.append({
+                    "id": token_id,
+                    "name": f"ENV Token {idx + 1}" if idx > 0 else "Default Token",
+                    "value": tk,
+                    "enabled": True,
+                    "added_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    "last_used_at": None,
+                    "total_requests": 0,
+                    "error_count": 0,
+                    "status": "active",
+                })
     return config
 
 

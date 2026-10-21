@@ -48,6 +48,12 @@ spec:
               value: "Asia/Shanghai"
             - name: PYTHONUNBUFFERED
               value: "1"
+            # 填入从 Tabbit 网页端复制的 Token（支持逗号分隔多个账号）:
+            - name: TABBIT_TOKEN
+              value: ""
+            # 客户端调用时的全局 API Key（可选，留空则无需鉴权）:
+            - name: TABBIT_API_KEY
+              value: ""
           resources:
             requests:
               cpu: 100m
