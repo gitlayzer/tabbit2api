@@ -402,6 +402,12 @@ async def _stream_handler(
             if et == "error":
                 error_msg = ed.get("message", str(ed))
                 logger.warning(f"[STREAM] Tabbit error event: {error_msg}")
+                err_chunk = {
+                    "id": completion_id,
+                    "object": "chat.completion.chunk",
+                    "choices": [{"index": 0, "delta": {"content": f"⚠️ Tabbit API 提示: {error_msg}"}, "finish_reason": None}],
+                }
+                yield f"data: {json.dumps(err_chunk, ensure_ascii=False)}\n\n"
                 yield f"data: {json.dumps({'id': completion_id, 'object': 'chat.completion.chunk', 'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'stop'}]})}\n\n"
                 yield "data: [DONE]\n\n"
                 return
@@ -535,17 +541,18 @@ async def chat_completions(
                 getattr(m, "role", "") in ("tool", "system") for m in req.messages
             ) or len(req.messages) > 2
 
-            # Multi-turn conversation formatter preserving full context and tool results
-            formatted_content = format_chat_messages(req.messages)
-
-            # Tool calling: inject authoritative instructions when tools are present
+            # Tool calling: build compact tool prompt if tools are present
+            tool_prompt = ""
             if has_tools:
                 tools_parsed = parse_openai_tools(req.tools)
                 tool_prompt = build_tool_prompt(tools_parsed)
-                if tool_prompt:
-                    content = tool_prompt + "\n\n" + formatted_content
-                else:
-                    content = formatted_content
+
+            # Control total length safely within Tabbit 7500 char threshold
+            remaining_budget = max(3000, 7200 - len(tool_prompt))
+            formatted_content = format_chat_messages(req.messages, max_budget=remaining_budget)
+
+            if tool_prompt:
+                content = tool_prompt + "\n\n" + formatted_content
             else:
                 content = formatted_content
             

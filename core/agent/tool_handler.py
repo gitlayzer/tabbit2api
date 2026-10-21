@@ -81,63 +81,38 @@ def parse_claude_tools(tools: List[dict]) -> List[dict]:
     return result
 
 
-def _compact_parameters(params: Any) -> Any:
-    if not isinstance(params, dict):
-        return {}
-    props = params.get("properties")
-    if not isinstance(props, dict):
-        return params
-    compact_props = {}
-    for p_name, p_val in props.items():
-        if isinstance(p_val, dict):
-            compact_props[p_name] = {
-                "type": p_val.get("type", "string"),
-                "description": (p_val.get("description", "") or "")[:150],
-            }
-            if "enum" in p_val:
-                compact_props[p_name]["enum"] = p_val["enum"][:10]
-        else:
-            compact_props[p_name] = {"type": "string"}
-    result = {
-        "type": "object",
-        "properties": compact_props,
-    }
-    if "required" in params and isinstance(params["required"], list):
-        result["required"] = params["required"]
-    return result
-
-
 def build_tool_prompt(tools: List[dict]) -> str:
-    """Build an authoritative tool-calling prompt to inject into the model context.
-    Instructs the model to output strict <tool_call> XML format when invoking tools.
+    """Build an authoritative, ultra-compact tool prompt to inject into model context.
+    Uses concise function signature style to stay well within Tabbit character limits.
     """
     if not tools:
         return ""
 
-    tool_descriptions = []
+    tool_lines = []
     for t in tools:
         name = t.get("name", "")
-        desc = (t.get("description", "") or "")[:250]
-        compact_params = _compact_parameters(t.get("parameters", {}))
-        params_str = json.dumps(compact_params, ensure_ascii=False)
-        tool_descriptions.append(
-            f"### Tool: {name}\n- Description: {desc}\n- Parameters Schema: {params_str}"
-        )
+        desc = (t.get("description", "") or "").split("\n")[0][:100]
+        params = t.get("parameters", {})
+        props = params.get("properties", {}) if isinstance(params, dict) else {}
+        param_sigs = []
+        for p_name, p_info in props.items():
+            p_type = p_info.get("type", "string") if isinstance(p_info, dict) else "string"
+            param_sigs.append(f"{p_name}: {p_type}")
+        sig = f"{name}({', '.join(param_sigs)})"
+        tool_lines.append(f"- {sig}: {desc}")
 
     prompt = (
-        "【CRITICAL SYSTEM INSTRUCTION: TOOLS AVAILABLE】\n"
-        "You have access to the following local environment tools to read/write files, execute terminal commands, or interact with the user's workspace:\n\n"
-        + "\n\n".join(tool_descriptions)
+        "【AVAILABLE TOOLS】\n"
+        "You have access to the following local environment tools:\n"
+        + "\n".join(tool_lines)
         + "\n\n"
-        "IMPORTANT RULES FOR TOOL INVOCATION:\n"
-        "1. When you need to inspect files, run terminal commands, or execute tasks on the user's computer, you MUST output a tool call block.\n"
-        "2. Do NOT pretend or fabricate that you have executed commands without calling the tool.\n"
-        "3. To invoke a tool, you MUST output strictly formatted XML like this:\n"
+        "RULES FOR TOOL USE:\n"
+        "1. When you need to read/modify files, run terminal commands, or interact with workspace, output exactly:\n"
         "<tool_call>\n"
-        '{"name": "<tool_name>", "arguments": {<arguments_json_object>}}\n'
+        '{"name": "<tool_name>", "arguments": {<json_arguments>}}\n'
         "</tool_call>\n"
-        "4. You can provide brief explanations before the tool call. Once outputting <tool_call>, the system will execute it and give you the result.\n"
-        "5. After receiving the tool result, continue the task."
+        "2. If no tool is needed (e.g. general questions or explanations), reply directly without <tool_call>.\n"
+        "3. After tool results are provided, continue your answer naturally."
     )
     return prompt
 
@@ -191,18 +166,20 @@ def detect_all_tool_calls(text: str) -> Tuple[str, List[ToolCall]]:
     return clean_text, tool_calls
 
 
-# ── Full Multi-Turn Chat Formatter (No Aggressive Truncation) ──
+# ── Budget-Aware Multi-Turn Chat Formatter ──
 
-def format_chat_messages(messages: List[Any]) -> str:
-    """Format full multi-turn chat messages into structured conversation text.
-    Preserves all user, assistant, system instructions, and tool execution results
-    without aggressive 500-char truncation, ensuring seamless Agent loop performance.
+def format_chat_messages(messages: List[Any], max_budget: int = 5500) -> str:
+    """Format multi-turn chat messages within a safe token/char budget for Tabbit.
+    Preserves:
+    1. System instructions (core instructions, compact)
+    2. Latest User query (100% complete)
+    3. Recent tool execution results (key content preserved)
+    4. Recent conversation turns, backwards until budget is reached
     """
     if not messages:
         return ""
 
-    formatted_parts = []
-
+    parsed = []
     for msg in messages:
         if isinstance(msg, dict):
             role = msg.get("role", "user")
@@ -215,7 +192,6 @@ def format_chat_messages(messages: List[Any]) -> str:
             tool_calls = getattr(msg, "tool_calls", None)
             tool_call_id = getattr(msg, "tool_call_id", None)
 
-        # Normalize content to string
         if isinstance(content, list):
             text_items = []
             for item in content:
@@ -224,35 +200,81 @@ def format_chat_messages(messages: List[Any]) -> str:
                         text_items.append(item.get("text", ""))
                     elif item.get("type") == "tool_result":
                         text_items.append(str(item.get("content", "")))
+                    else:
+                        text_items.append(str(item.get("content", "")))
                 else:
                     text_items.append(str(item))
             content_str = "\n".join(text_items)
         else:
             content_str = str(content or "")
 
-        if role == "system":
-            # Preserve system instructions
-            if content_str.strip():
-                formatted_parts.append(f"[System Instruction]:\n{content_str}")
-        elif role == "user":
-            formatted_parts.append(f"[User]:\n{content_str}")
+        parsed.append({
+            "role": role,
+            "content": content_str.strip(),
+            "tool_calls": tool_calls,
+            "tool_call_id": tool_call_id,
+        })
+
+    # Separate system messages and dialog messages
+    system_texts = []
+    dialog_msgs = []
+    for m in parsed:
+        if m["role"] == "system":
+            if m["content"]:
+                system_texts.append(m["content"])
+        else:
+            dialog_msgs.append(m)
+
+    # System instruction: compact to max 1200 chars if overly bloated
+    system_block = ""
+    if system_texts:
+        full_sys = "\n".join(system_texts)
+        if len(full_sys) > 1200:
+            full_sys = full_sys[:1200] + "..."
+        system_block = f"[System Instruction]:\n{full_sys}"
+
+    remaining_budget = max_budget - len(system_block) - 50
+
+    # From newest to oldest, accumulate dialog messages
+    collected_dialog = []
+    used_len = 0
+
+    for m in reversed(dialog_msgs):
+        role = m["role"]
+        c_str = m["content"]
+        
+        if role == "user":
+            part = f"[User]:\n{c_str}"
         elif role == "assistant":
-            # If previous assistant executed tool calls, format them for model context
-            if tool_calls:
-                call_descs = []
-                for tc in tool_calls:
+            tc_desc = ""
+            if m["tool_calls"]:
+                calls = []
+                for tc in m["tool_calls"]:
                     fn = tc.get("function", {}) if isinstance(tc, dict) else getattr(tc, "function", {})
                     name = fn.get("name", "") if isinstance(fn, dict) else getattr(fn, "name", "")
-                    args = fn.get("arguments", "") if isinstance(fn, dict) else getattr(fn, "arguments", "")
-                    call_descs.append(f"{name}({args})")
-                formatted_parts.append(f"[Assistant Invoked Tools]: {', '.join(call_descs)}")
-            if content_str.strip():
-                formatted_parts.append(f"[Assistant]:\n{content_str}")
+                    calls.append(name)
+                tc_desc = f"[Assistant Invoked Tools]: {', '.join(calls)}\n"
+            part = f"{tc_desc}[Assistant]:\n{c_str}".strip()
         elif role == "tool":
-            call_id_tag = f" ({tool_call_id})" if tool_call_id else ""
-            formatted_parts.append(f"[Tool Execution Result{call_id_tag}]:\n{content_str}")
+            if len(c_str) > 1500:
+                c_str = c_str[:1500] + "\n...(truncated)"
+            tag = f" ({m['tool_call_id']})" if m.get("tool_call_id") else ""
+            part = f"[Tool Result{tag}]:\n{c_str}"
+        else:
+            part = f"[{role.capitalize()}]:\n{c_str}"
 
-    return "\n\n".join(formatted_parts)
+        if used_len + len(part) > remaining_budget and collected_dialog:
+            break
+
+        collected_dialog.insert(0, part)
+        used_len += len(part) + 2
+
+    final_parts = []
+    if system_block:
+        final_parts.append(system_block)
+    final_parts.extend(collected_dialog)
+
+    return "\n\n".join(final_parts)
 
 
 # ── OpenAI Tool Call Responses ──
