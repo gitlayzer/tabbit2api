@@ -163,52 +163,106 @@ def _try_parse_tool_json(raw_str: str) -> Optional[ToolCall]:
     return None
 
 
+def extract_json_objects(text: str) -> List[Tuple[dict, int, int]]:
+    """Extract all valid JSON objects from text using depth-tracking balance parser.
+    Returns list of (parsed_dict, start_pos, end_pos).
+    Properly ignores braces inside strings and handles escapes.
+    """
+    results = []
+    i = 0
+    n = len(text)
+    while i < n:
+        if text[i] == "{":
+            start = i
+            depth = 0
+            in_string = False
+            escape = False
+            j = i
+            while j < n:
+                char = text[j]
+                if escape:
+                    escape = False
+                elif char == "\\":
+                    escape = True
+                elif char == '"':
+                    in_string = not in_string
+                elif not in_string:
+                    if char == "{":
+                        depth += 1
+                    elif char == "}":
+                        depth -= 1
+                        if depth == 0:
+                            raw_candidate = text[start:j+1]
+                            try:
+                                obj = json.loads(raw_candidate)
+                                if isinstance(obj, dict):
+                                    results.append((obj, start, j+1))
+                                    i = j
+                                    break
+                            except Exception:
+                                pass
+                j += 1
+        i += 1
+    return results
+
+
 def detect_all_tool_calls(text: str) -> Tuple[str, List[ToolCall]]:
     """Detect all tool call blocks in text, supporting:
-    - <tool_call>...</tool_call>
+    - Standard <tool_call>...</tool_call>
+    - Unclosed or DSML-closed <tool_call>... </ | | DSML ...>
     - <tool>...</tool>
     - ```tool_call ... ```
     - ```json {"name": "...", "arguments": ...} ```
+    - Raw JSON with name and arguments anywhere in context
     Returns (clean_text, [ToolCall, ...]).
     """
     tool_calls = []
     clean_text = text
 
-    # 1. Standard <tool_call>...</tool_call>
-    matches = list(TOOL_CALL_PATTERN.finditer(text))
-    if matches:
-        clean_text = TOOL_CALL_PATTERN.sub("", clean_text).strip()
-        for m in matches:
-            tc = _try_parse_tool_json(m.group(1))
-            if tc:
-                tool_calls.append(tc)
+    # Identify the earliest marker that indicates tool calling begun
+    markers = ["<tool_call", "<tool", "```tool_call", "```tool", "<｜tool", "<|tool", "</ | | DSML", "<｜DSML"]
+    first_marker_pos = -1
+    for m in markers:
+        pos = text.lower().find(m.lower())
+        if pos != -1:
+            if first_marker_pos == -1 or pos < first_marker_pos:
+                first_marker_pos = pos
 
-    # 2. <tool>...</tool>
-    tag_matches = list(TOOL_TAG_PATTERN.finditer(clean_text))
-    if tag_matches:
-        clean_text = TOOL_TAG_PATTERN.sub("", clean_text).strip()
-        for m in tag_matches:
-            tc = _try_parse_tool_json(m.group(1))
-            if tc:
-                tool_calls.append(tc)
+    # Extract all top-level JSON objects via balanced braces
+    json_objs = extract_json_objects(text)
+    for obj, start, end in json_objs:
+        fn_name = obj.get("name") or obj.get("tool") or obj.get("function") or ""
+        fn_args = obj.get("arguments") or obj.get("parameters") or obj.get("args") or {}
+        if isinstance(fn_args, str):
+            try:
+                fn_args = json.loads(fn_args)
+            except Exception:
+                pass
+        if fn_name and isinstance(fn_name, str):
+            tool_calls.append(ToolCall(
+                id=f"call_{uuid.uuid4().hex[:12]}",
+                name=fn_name,
+                arguments=fn_args if isinstance(fn_args, dict) else {"input": fn_args},
+            ))
 
-    # 3. ```tool_call ... ```
-    cb_matches = list(TOOL_CODEBLOCK_PATTERN.finditer(clean_text))
-    if cb_matches:
-        clean_text = TOOL_CODEBLOCK_PATTERN.sub("", clean_text).strip()
-        for m in cb_matches:
-            tc = _try_parse_tool_json(m.group(1))
-            if tc:
-                tool_calls.append(tc)
+    if tool_calls:
+        if first_marker_pos != -1:
+            clean_text = text[:first_marker_pos].strip()
+        else:
+            # If no clear marker prefix, strip each recognized tool call JSON block
+            clean_text = text
+            for obj, start, end in reversed(json_objs):
+                fn_name = obj.get("name") or obj.get("tool") or obj.get("function") or ""
+                if fn_name:
+                    clean_text = clean_text[:start] + clean_text[end:]
+            clean_text = clean_text.strip()
 
-    # 4. Fallback: inspect any markdown ```json codeblock containing name/arguments
-    if not tool_calls:
-        json_blocks = re.findall(r"```(?:json)?\s*(\{[\s\S]*?\})\s*```", clean_text, re.DOTALL | re.IGNORECASE)
-        for jb in json_blocks:
-            tc = _try_parse_tool_json(jb)
-            if tc:
-                tool_calls.append(tc)
-                clean_text = clean_text.replace(jb, "").strip()
+        # Strip any residual markup (DSML tokens, tool tags, unclosed brackets)
+        clean_text = re.sub(r"<[^>]*DSML[^>]*>", "", clean_text, flags=re.IGNORECASE)
+        clean_text = re.sub(r"<\/?tool_call[\s\S]*?>", "", clean_text, flags=re.IGNORECASE)
+        clean_text = re.sub(r"<\/?tool[\s\S]*?>", "", clean_text, flags=re.IGNORECASE)
+        clean_text = re.sub(r"</\s*\|\s*\|\s*[^>]*>", "", clean_text, flags=re.IGNORECASE)
+        clean_text = clean_text.strip()
 
     return clean_text, tool_calls
 

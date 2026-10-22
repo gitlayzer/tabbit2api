@@ -440,7 +440,7 @@ async def _stream_handler(
                         yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
                     else:
                         # 有 tools 对话：检查是否出现了任何工具调用相关标记
-                        if any(marker in buffered_text for marker in ["<tool_call", "<tool", "```tool"]):
+                        if any(marker in buffered_text.lower() for marker in ["<tool_call", "<tool", "```tool", "<｜tool", "<|tool", "</ | | dsml", "<｜dsml", "<|dsml"]):
                             in_tool_call_mode = True
 
                         if not in_tool_call_mode:
@@ -486,13 +486,13 @@ async def _stream_handler(
                     yield c
                 return
             else:
-                # 纯文本对话（没有调用工具），补齐尚未发送的文本
-                remaining = buffered_text[len(streamed_text):]
-                if remaining:
+                # 纯文本对话（没有调用工具），补齐尚未发送的文本（确保清洗掉异常标签）
+                clean_remaining = clean_text[len(streamed_text):] if len(clean_text) >= len(streamed_text) else ""
+                if clean_remaining:
                     chunk_text = {
                         "id": completion_id,
                         "object": "chat.completion.chunk",
-                        "choices": [{"index": 0, "delta": {"content": remaining}, "finish_reason": None}],
+                        "choices": [{"index": 0, "delta": {"content": clean_remaining}, "finish_reason": None}],
                     }
                     yield f"data: {json.dumps(chunk_text, ensure_ascii=False)}\n\n"
                 yield f"data: {json.dumps({'id': completion_id, 'object': 'chat.completion.chunk', 'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'stop'}]})}\n\n"

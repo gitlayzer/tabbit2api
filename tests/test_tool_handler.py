@@ -70,6 +70,18 @@ def test_detect_tool_call_markdown_codeblock():
     assert calls[0].arguments == {"city": "Shanghai"}
 
 
+def test_detect_tool_call_deepseek_dsml():
+    # 模拟真实线上截图中 DeepSeek 输出带有 </ | | DSML ...> 标签的案例
+    raw = """我来创建脚本并直接运行。
+
+<tool_call> {"name": "Write", "arguments": {"file_path": "/Users/sealos/.zcode/workspace/draft-2a46b959-7bd9-451e-86c0-dff3d9f5235c/hello.js", "content": "#!/usr/bin/env node\\nconsole.log(1);"}} </ | | DSML | | parameter> </ | | DSML | | invoke> </ | | DSML | | calls>"""
+    clean, calls = detect_all_tool_calls(raw)
+    assert len(calls) == 1
+    assert calls[0].name == "Write"
+    assert calls[0].arguments["file_path"].endswith("hello.js")
+    assert clean == "我来创建脚本并直接运行。"
+
+
 def test_detect_tool_call_none():
     assert detect_tool_call("no tool call here") is None
 
