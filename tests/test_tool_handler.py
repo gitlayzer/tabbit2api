@@ -51,7 +51,7 @@ def test_build_tool_prompt():
     prompt = build_tool_prompt(tools)
     assert "get_weather" in prompt
     assert "<tool_call>" in prompt
-    assert "严禁口头承诺" in prompt
+    assert "严禁" in prompt
 
 
 def test_detect_tool_call_standard():
@@ -117,6 +117,19 @@ def test_fallback_verbal_tool_call():
     assert c2[0].name == "Agent"
 
 
+def test_fallback_verbal_tool_call_no_agent_safety():
+    # 模拟 Pi 客户端：只有 bash/write/read，没有 Agent 工具
+    tools = [
+        {"name": "bash", "parameters": {"properties": {"command": {"type": "string"}}}},
+        {"name": "write", "parameters": {"properties": {"path": {"type": "string"}, "content": {"type": "string"}}}}
+    ]
+    messages = [{"role": "user", "content": "帮我写一个 nodejs 的 api"}]
+    reply = "我来帮你创建一个简单的 Node.js Hello World API 并在本地运行起来，现在开始执行。"
+    # 严禁将中文自然语言当做 bash 命令下发！
+    calls = fallback_verbal_tool_call(reply, tools, messages)
+    assert len(calls) == 0
+
+
 def test_build_tool_prompt_many_tools():
     # 模拟 ZCode 发来 55 个工具的极端情况
     tools = []
@@ -135,7 +148,7 @@ def test_build_tool_prompt_many_tools():
             "parameters": {"properties": {"doc_id": {"type": "string"}, "view": {"type": "string"}}}
         })
     prompt = build_tool_prompt(tools)
-    assert len(prompt) < 2500
+    assert len(prompt) < 3000
     assert "Agent" in prompt
     assert "Bash" in prompt
     assert "Write" in prompt

@@ -136,14 +136,20 @@ def build_tool_prompt(tools: List[dict], max_chars: int = 2200) -> str:
         + "\n".join(tool_lines)
         + "\n\n"
         "【执行规则（最高优先级）/ MANDATORY RULES】：\n"
-        "1. 【立即行动】：当用户要求写代码、创建修改文件、运行终端或启动任务时，你必须【在本次回复中直接调用工具】！\n"
-        "2. 【严禁口头承诺】：绝对禁止仅在口头上回复“我来用 Agent 模式”、“先进入 Agent 流程”、“我来为你搭建”、“我马上在本地为你”等空话承诺！你必须立刻输出 <tool_call>！\n"
-        "3. 【工具调用格式】：格式必须严格为：\n"
+        "1. 【严禁自然语言口头承诺】：绝对禁止仅在口头上回复“我来帮你写...”、“我这就开始...”、“好的，我马上在本地为你搭建...”、“现在开始执行”等任何无意义的客套话！严禁只说不调！\n"
+        "2. 【直接以工具调用开头】：当用户要求写代码、创建修改文件、运行终端或启动任务时，你的回复必须【直接以 <tool_call> 开头】！严禁在 <tool_call> 前面输出任何中文句子！\n"
+        "3. 【工具调用格式】：\n"
         "<tool_call>\n"
         '{"name": "<tool_name>", "arguments": {<json_arguments>}}\n'
-        "</tool_call>\n"
-        "4. 你可在 <tool_call> 前附带 1 句极简行动说明，但之后必须紧跟 <tool_call>，禁止只说不调！\n"
-        "5. 只有纯学术问答或打招呼无需操作环境时，才直接输出自然语言。"
+        "</tool_call>\n\n"
+        "【正确示范 / CORRECT EXAMPLE】：\n"
+        "User: 帮我写一个 nodejs 的 api 并运行起来\n"
+        "Assistant:\n"
+        "<tool_call>\n"
+        '{"name": "write", "arguments": {"path": "app.js", "content": "const http = require(\'http\');\\nconst server = http.createServer((req, res) => res.end(\'Hello World\'));\\nserver.listen(3000, () => console.log(\'Server on 3000\'));"}}\n'
+        "</tool_call>\n\n"
+        "【错误示范（绝对禁止）/ FORBIDDEN】：\n"
+        "好的，我来帮你创建一个简单的 Node.js Hello World API 并在本地运行起来，现在开始执行。<--- 严重违规！绝对禁止输出纯口头回复！"
     )
     return prompt
 
@@ -322,25 +328,15 @@ def fallback_verbal_tool_call(
     if not has_promise:
         return []
 
-    # Find the best target tool to invoke
+    # Find an Agent orchestration tool (e.g. ZCode's "Agent" or "Task")
+    # SAFETY: ONLY target tools whose parameter explicitly accepts a task prompt.
+    # NEVER fallback to 'bash', 'write' or 'read' with natural language!
     target_tool = None
     for t in tools:
         t_name = t.get("name", "").lower()
         if t_name in ("agent", "task", "task_mode", "launch_agent", "execute_agent"):
             target_tool = t
             break
-
-    # If only 1 tool provided by client, use that tool
-    if not target_tool and len(tools) == 1:
-        target_tool = tools[0]
-
-    # If no agent tool, try finding Bash or Write
-    if not target_tool:
-        for t in tools:
-            t_name = t.get("name", "").lower()
-            if t_name in ("bash", "write"):
-                target_tool = t
-                break
 
     if not target_tool:
         return []
@@ -349,7 +345,7 @@ def fallback_verbal_tool_call(
     params = target_tool.get("parameters", {})
     props = params.get("properties", {}) if isinstance(params, dict) else {}
     arg_name = "prompt"
-    for candidate in ["prompt", "task", "instruction", "input", "query", "command"]:
+    for candidate in ["prompt", "task", "instruction", "input", "query"]:
         if candidate in props:
             arg_name = candidate
             break
@@ -496,7 +492,7 @@ def format_chat_messages(messages: List[Any], max_budget: int = 5500, has_tools:
 
     if has_tools:
         final_parts.append(
-            "[System Action Directive]: If the user's request requires action (e.g. writing code, files, running tasks), invoke the tool NOW with <tool_call>...</tool_call>. DO NOT reply with conversational promises or explanations of entering task mode."
+            "[System Action Directive]: If this request involves actions (writing code, files, running commands), you MUST start your reply directly with <tool_call>. DO NOT say '我来帮你' or '现在开始执行'. Output <tool_call> immediately."
         )
     final_parts.append("[Assistant]:")
 
