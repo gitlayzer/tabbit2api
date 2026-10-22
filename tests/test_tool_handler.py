@@ -87,27 +87,58 @@ def test_detect_tool_call_none():
 
 
 def test_fallback_verbal_tool_call():
-    # 模拟用户在 ZCode 中提问，模型口头承诺“进入任务模式”，但漏掉了 <tool_call>
     tools = [
         {
             "name": "Agent",
             "description": "Launch a new agent to handle complex, multi-step tasks",
             "parameters": {
                 "properties": {
-                    "prompt": {"type": "string", "description": "The task prompt"}
+                    "prompt": {"type": "string", "description": "The task prompt"},
+                    "description": {"type": "string"}
                 }
             }
         }
     ]
     messages = [
-        {"role": "user", "content": "帮我用 nodejs 写一个 hello world 的 api 并运行起来"}
+        {"role": "user", "content": "你可以帮我开发一个 nodejs 的 helloworld 的 api，然后本地运行起来吗？"}
     ]
-    model_reply = "我来帮你完成这个任务。写一个 Node.js 的 Hello World API 并把它跑起来，需要进入任务模式来实际编写代码并执行。"
-    
-    calls = fallback_verbal_tool_call(model_reply, tools, messages)
-    assert len(calls) == 1
-    assert calls[0].name == "Agent"
-    assert calls[0].arguments == {"prompt": "帮我用 nodejs 写一个 hello world 的 api 并运行起来"}
+    # Case 1: "我来用 Agent 模式创建"
+    r1 = "我来用 Agent 模式创建一个 Node.js Hello World API，并在本地启动它。"
+    c1 = fallback_verbal_tool_call(r1, tools, messages)
+    assert len(c1) == 1
+    assert c1[0].name == "Agent"
+    assert "开发一个 nodejs" in c1[0].arguments["prompt"]
+    assert "description" in c1[0].arguments
+
+    # Case 2: "先进入 Agent 执行流程"
+    r2 = "好的，我马上在本地为你搭建一个 Node.js Hello World API 并启动它，先进入 Agent 执行流程。"
+    c2 = fallback_verbal_tool_call(r2, tools, messages)
+    assert len(c2) == 1
+    assert c2[0].name == "Agent"
+
+
+def test_build_tool_prompt_many_tools():
+    # 模拟 ZCode 发来 55 个工具的极端情况
+    tools = []
+    # 核心工具
+    for name in ["Agent", "Bash", "Write", "Edit", "Read", "AskUserQuestion"]:
+        tools.append({
+            "name": name,
+            "description": f"Tool description for {name}",
+            "parameters": {"properties": {"input": {"type": "string"}}}
+        })
+    # 50 个 MCP 插件工具
+    for i in range(50):
+        tools.append({
+            "name": f"mcp__plugin_doc_{i}",
+            "description": f"Long detailed description for document plugin number {i}",
+            "parameters": {"properties": {"doc_id": {"type": "string"}, "view": {"type": "string"}}}
+        })
+    prompt = build_tool_prompt(tools)
+    assert len(prompt) < 2500
+    assert "Agent" in prompt
+    assert "Bash" in prompt
+    assert "Write" in prompt
 
 
 def test_format_chat_messages_directive():

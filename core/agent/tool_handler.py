@@ -81,25 +81,54 @@ def parse_claude_tools(tools: List[dict]) -> List[dict]:
     return result
 
 
-def build_tool_prompt(tools: List[dict]) -> str:
+CORE_TOOL_NAMES = {
+    "agent", "bash", "write", "edit", "read", "askuserquestion",
+    "taskoutput", "taskstop", "enterplanmode", "exitplanmode", "skill", "webfetch", "todo"
+}
+
+
+def build_tool_prompt(tools: List[dict], max_chars: int = 2200) -> str:
     """Build an authoritative, ultra-compact tool prompt to inject into model context.
-    Uses concise function signature style to stay well within Tabbit character limits.
+    Prioritizes core tools (Bash, Write, Read, Agent, etc.) and caps non-core tools
+    to strictly prevent exceeding Tabbit's safe character ceiling.
     """
     if not tools:
         return ""
 
-    tool_lines = []
+    core_tools = []
+    other_tools = []
     for t in tools:
+        t_name = t.get("name", "").lower()
+        if any(c in t_name for c in CORE_TOOL_NAMES):
+            core_tools.append(t)
+        else:
+            other_tools.append(t)
+
+    tool_lines = []
+    for t in core_tools:
         name = t.get("name", "")
-        desc = (t.get("description", "") or "").split("\n")[0][:120]
+        desc = (t.get("description", "") or "").split("\n")[0][:80]
         params = t.get("parameters", {})
         props = params.get("properties", {}) if isinstance(params, dict) else {}
-        param_sigs = []
-        for p_name, p_info in props.items():
-            p_type = p_info.get("type", "string") if isinstance(p_info, dict) else "string"
-            param_sigs.append(f"{p_name}: {p_type}")
-        sig = f"{name}({', '.join(param_sigs)})"
+        param_sigs = [
+            f"{p_name}: {p_info.get('type', 'string') if isinstance(p_info, dict) else 'string'}"
+            for p_name, p_info in props.items()
+        ]
+        sig = f"{name}({', '.join(param_sigs[:4])})"
         tool_lines.append(f"- {sig}: {desc}")
+
+    curr_len = sum(len(l) for l in tool_lines)
+    for t in other_tools:
+        if curr_len > max_chars - 350:
+            remaining_count = len(other_tools) - (len(tool_lines) - len(core_tools))
+            if remaining_count > 0:
+                tool_lines.append(f"- ... (plus {remaining_count} additional specialized tools)")
+            break
+        name = t.get("name", "")
+        desc = (t.get("description", "") or "").split("\n")[0][:50]
+        line = f"- {name}: {desc}"
+        tool_lines.append(line)
+        curr_len += len(line)
 
     prompt = (
         "【系统环境可用工具 / AVAILABLE TOOLS】\n"
@@ -107,8 +136,8 @@ def build_tool_prompt(tools: List[dict]) -> str:
         + "\n".join(tool_lines)
         + "\n\n"
         "【执行规则（最高优先级）/ MANDATORY RULES】：\n"
-        "1. 【立即行动】：当用户要求写代码、创建修改文件、运行终端或执行具体任务时，你必须【在本次回复中直接调用工具】！\n"
-        "2. 【严禁口头承诺】：绝对禁止仅在口头上回复“我来帮你写”、“需要进入任务模式”、“这次我直接进入任务模式”等空话承诺！你必须立刻输出 <tool_call>！\n"
+        "1. 【立即行动】：当用户要求写代码、创建修改文件、运行终端或启动任务时，你必须【在本次回复中直接调用工具】！\n"
+        "2. 【严禁口头承诺】：绝对禁止仅在口头上回复“我来用 Agent 模式”、“先进入 Agent 流程”、“我来为你搭建”、“我马上在本地为你”等空话承诺！你必须立刻输出 <tool_call>！\n"
         "3. 【工具调用格式】：格式必须严格为：\n"
         "<tool_call>\n"
         '{"name": "<tool_name>", "arguments": {<json_arguments>}}\n'
@@ -279,13 +308,17 @@ def fallback_verbal_tool_call(
     if not tools or not text:
         return []
 
-    # Check for verbal promise markers
+    # Check for verbal promise markers across variations
     task_promise_keywords = [
+        "agent 模式", "agent模式", "agent 流程", "agent流程", "agent 执行流程", "agent执行流程",
+        "进入 agent", "启动 agent", "我来用 agent", "先进入 agent",
         "进入任务模式", "任务模式", "直接进入任务", "切换到任务模式",
-        "我来帮你完成这个任务", "我来帮你写", "我来帮你创建", "帮你把",
-        "enter task mode", "entering task mode", "I will create", "I will implement",
+        "我来帮你完成", "我来帮你写", "我来帮你创建", "帮你把", "我来为你搭建", "为你搭建",
+        "我马上在本地为你", "在本地为你搭建", "我来创建", "我来用", "先进入", "准备为你",
+        "我来为你编写", "我来为你生成", "我来编写", "我来运行",
+        "enter task mode", "entering task mode", "agent mode", "I will create", "I will implement",
     ]
-    has_promise = any(kw in text for kw in task_promise_keywords)
+    has_promise = any(kw in text.lower() for kw in task_promise_keywords)
     if not has_promise:
         return []
 
@@ -300,6 +333,14 @@ def fallback_verbal_tool_call(
     # If only 1 tool provided by client, use that tool
     if not target_tool and len(tools) == 1:
         target_tool = tools[0]
+
+    # If no agent tool, try finding Bash or Write
+    if not target_tool:
+        for t in tools:
+            t_name = t.get("name", "").lower()
+            if t_name in ("bash", "write"):
+                target_tool = t
+                break
 
     if not target_tool:
         return []
@@ -328,14 +369,18 @@ def fallback_verbal_tool_call(
                 break
 
     task_payload = latest_user_text or text
+    tool_args = {arg_name: task_payload}
+    if "description" in props and "description" not in tool_args:
+        tool_args["description"] = f"Run: {task_payload[:60]}"
+
     logger.warning(
-        f"[FALLBACK] Automatically converted verbal promise to ToolCall: tool={target_tool.get('name')} arg={arg_name}"
+        f"[FALLBACK] Automatically converted verbal promise to ToolCall: tool={target_tool.get('name')} args={list(tool_args.keys())}"
     )
     return [
         ToolCall(
             id=f"call_{uuid.uuid4().hex[:12]}",
             name=target_tool.get("name", "Agent"),
-            arguments={arg_name: task_payload},
+            arguments=tool_args,
         )
     ]
 

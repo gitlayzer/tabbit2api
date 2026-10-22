@@ -560,14 +560,19 @@ async def chat_completions(
                 tool_prompt = build_tool_prompt(tools_parsed)
                 logger.info(f"[TOOLS] Received {len(tools_parsed)} tools: {[t.get('name') for t in tools_parsed]}")
 
-            # Control total length safely within Tabbit 7500 char threshold
-            remaining_budget = max(3000, 7200 - len(tool_prompt))
+            # Control total length safely within Tabbit 7000 char threshold
+            remaining_budget = max(1500, 6800 - len(tool_prompt))
             formatted_content = format_chat_messages(req.messages, max_budget=remaining_budget, has_tools=has_tools)
 
             if tool_prompt:
                 content = tool_prompt + "\n\n" + formatted_content
             else:
                 content = formatted_content
+
+            # Hard cap at 7000 chars to guarantee never overloading Tabbit upstream
+            if len(content) > 7000:
+                logger.warning(f"Total content ({len(content)} chars) exceeds safe ceiling, truncating to 7000")
+                content = content[:7000]
             
             logger.info(f"[DEBUG] Final content ({len(content)} chars): {content[:300]}")
     except Exception as e:
