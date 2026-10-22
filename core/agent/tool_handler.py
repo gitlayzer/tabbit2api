@@ -91,7 +91,7 @@ def build_tool_prompt(tools: List[dict]) -> str:
     tool_lines = []
     for t in tools:
         name = t.get("name", "")
-        desc = (t.get("description", "") or "").split("\n")[0][:100]
+        desc = (t.get("description", "") or "").split("\n")[0][:120]
         params = t.get("parameters", {})
         props = params.get("properties", {}) if isinstance(params, dict) else {}
         param_sigs = []
@@ -102,17 +102,19 @@ def build_tool_prompt(tools: List[dict]) -> str:
         tool_lines.append(f"- {sig}: {desc}")
 
     prompt = (
-        "【AVAILABLE TOOLS】\n"
-        "You have access to the following local environment tools:\n"
+        "【系统环境可用工具 / AVAILABLE TOOLS】\n"
+        "你当前处于 Agent 自动化开发环境中，必须通过调用以下本地工具完成文件读写、代码编写与命令执行：\n"
         + "\n".join(tool_lines)
         + "\n\n"
-        "RULES FOR TOOL USE:\n"
-        "1. When you need to read/modify files, run terminal commands, or interact with workspace, output exactly:\n"
+        "【执行规则（最高优先级）/ MANDATORY RULES】：\n"
+        "1. 【立即行动】：当用户要求写代码、创建修改文件、运行终端或执行具体任务时，你必须【在本次回复中直接调用工具】！\n"
+        "2. 【严禁口头承诺】：绝对禁止仅在口头上回复“我来帮你写”、“需要进入任务模式”、“这次我直接进入任务模式”等空话承诺！你必须立刻输出 <tool_call>！\n"
+        "3. 【工具调用格式】：格式必须严格为：\n"
         "<tool_call>\n"
         '{"name": "<tool_name>", "arguments": {<json_arguments>}}\n'
         "</tool_call>\n"
-        "2. If no tool is needed (e.g. general questions or explanations), reply directly without <tool_call>.\n"
-        "3. After tool results are provided, continue your answer naturally."
+        "4. 你可在 <tool_call> 前附带 1 句极简行动说明，但之后必须紧跟 <tool_call>，禁止只说不调！\n"
+        "5. 只有纯学术问答或打招呼无需操作环境时，才直接输出自然语言。"
     )
     return prompt
 
@@ -122,6 +124,12 @@ def build_tool_prompt(tools: List[dict]) -> str:
 TOOL_CALL_PATTERN = re.compile(
     r"<tool_call>\s*([\s\S]*?)\s*</tool_call>", re.DOTALL | re.IGNORECASE
 )
+TOOL_TAG_PATTERN = re.compile(
+    r"<tool>\s*([\s\S]*?)\s*</tool>", re.DOTALL | re.IGNORECASE
+)
+TOOL_CODEBLOCK_PATTERN = re.compile(
+    r"```(?:tool_call|tool)\s*([\s\S]*?)\s*```", re.DOTALL | re.IGNORECASE
+)
 
 
 def detect_tool_call(text: str) -> Optional[ToolCall]:
@@ -130,51 +138,164 @@ def detect_tool_call(text: str) -> Optional[ToolCall]:
     return calls[0] if calls else None
 
 
+def _try_parse_tool_json(raw_str: str) -> Optional[ToolCall]:
+    """Attempt to parse a JSON string into a ToolCall object."""
+    cleaned = raw_str.strip()
+    cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s*```$", "", cleaned)
+    try:
+        data = json.loads(cleaned)
+        fn_name = data.get("name") or data.get("tool") or data.get("function") or ""
+        fn_args = data.get("arguments") or data.get("parameters") or data.get("args") or {}
+        if isinstance(fn_args, str):
+            try:
+                fn_args = json.loads(fn_args)
+            except Exception:
+                pass
+        if fn_name:
+            return ToolCall(
+                id=f"call_{uuid.uuid4().hex[:12]}",
+                name=fn_name,
+                arguments=fn_args if isinstance(fn_args, dict) else {"input": fn_args},
+            )
+    except Exception:
+        pass
+    return None
+
+
 def detect_all_tool_calls(text: str) -> Tuple[str, List[ToolCall]]:
-    """Detect all <tool_call> blocks in text, return (clean_text, [ToolCall, ...]).
-    Also supports fallback code block format like ```json {"tool": "...", "parameters": {...}} ```.
+    """Detect all tool call blocks in text, supporting:
+    - <tool_call>...</tool_call>
+    - <tool>...</tool>
+    - ```tool_call ... ```
+    - ```json {"name": "...", "arguments": ...} ```
+    Returns (clean_text, [ToolCall, ...]).
     """
     tool_calls = []
     clean_text = text
-    matches = list(TOOL_CALL_PATTERN.finditer(text))
 
+    # 1. Standard <tool_call>...</tool_call>
+    matches = list(TOOL_CALL_PATTERN.finditer(text))
     if matches:
-        clean_text = TOOL_CALL_PATTERN.sub("", text).strip()
+        clean_text = TOOL_CALL_PATTERN.sub("", clean_text).strip()
         for m in matches:
-            raw_json = m.group(1).strip()
-            # Strip markdown code blocks if wrapped inside
-            raw_json = re.sub(r"^```(?:json)?\s*", "", raw_json)
-            raw_json = re.sub(r"\s*```$", "", raw_json)
-            try:
-                data = json.loads(raw_json)
-                fn_name = data.get("name") or data.get("tool") or data.get("function") or ""
-                fn_args = data.get("arguments") or data.get("parameters") or data.get("args") or {}
-                if isinstance(fn_args, str):
-                    try:
-                        fn_args = json.loads(fn_args)
-                    except Exception:
-                        pass
-                if fn_name:
-                    tool_calls.append(ToolCall(
-                        id=f"call_{uuid.uuid4().hex[:12]}",
-                        name=fn_name,
-                        arguments=fn_args if isinstance(fn_args, dict) else {"input": fn_args},
-                    ))
-            except Exception as e:
-                logger.warning(f"Error parsing tool call JSON: {e}, raw: {raw_json[:120]}")
+            tc = _try_parse_tool_json(m.group(1))
+            if tc:
+                tool_calls.append(tc)
+
+    # 2. <tool>...</tool>
+    tag_matches = list(TOOL_TAG_PATTERN.finditer(clean_text))
+    if tag_matches:
+        clean_text = TOOL_TAG_PATTERN.sub("", clean_text).strip()
+        for m in tag_matches:
+            tc = _try_parse_tool_json(m.group(1))
+            if tc:
+                tool_calls.append(tc)
+
+    # 3. ```tool_call ... ```
+    cb_matches = list(TOOL_CODEBLOCK_PATTERN.finditer(clean_text))
+    if cb_matches:
+        clean_text = TOOL_CODEBLOCK_PATTERN.sub("", clean_text).strip()
+        for m in cb_matches:
+            tc = _try_parse_tool_json(m.group(1))
+            if tc:
+                tool_calls.append(tc)
+
+    # 4. Fallback: inspect any markdown ```json codeblock containing name/arguments
+    if not tool_calls:
+        json_blocks = re.findall(r"```(?:json)?\s*(\{[\s\S]*?\})\s*```", clean_text, re.DOTALL | re.IGNORECASE)
+        for jb in json_blocks:
+            tc = _try_parse_tool_json(jb)
+            if tc:
+                tool_calls.append(tc)
+                clean_text = clean_text.replace(jb, "").strip()
 
     return clean_text, tool_calls
 
 
+def fallback_verbal_tool_call(
+    text: str,
+    tools: List[dict],
+    messages: List[Any],
+) -> List[ToolCall]:
+    """If the model verbally promises to enter task mode or fulfill a task
+    without emitting tool call tags, automatically wrap it into an Agent tool call
+    to prevent desktop Agent clients (ZCode/Cline/Cursor) from stalling.
+    """
+    if not tools or not text:
+        return []
+
+    # Check for verbal promise markers
+    task_promise_keywords = [
+        "进入任务模式", "任务模式", "直接进入任务", "切换到任务模式",
+        "我来帮你完成这个任务", "我来帮你写", "我来帮你创建", "帮你把",
+        "enter task mode", "entering task mode", "I will create", "I will implement",
+    ]
+    has_promise = any(kw in text for kw in task_promise_keywords)
+    if not has_promise:
+        return []
+
+    # Find the best target tool to invoke
+    target_tool = None
+    for t in tools:
+        t_name = t.get("name", "").lower()
+        if t_name in ("agent", "task", "task_mode", "launch_agent", "execute_agent"):
+            target_tool = t
+            break
+
+    # If only 1 tool provided by client, use that tool
+    if not target_tool and len(tools) == 1:
+        target_tool = tools[0]
+
+    if not target_tool:
+        return []
+
+    # Determine parameter name for the task prompt
+    params = target_tool.get("parameters", {})
+    props = params.get("properties", {}) if isinstance(params, dict) else {}
+    arg_name = "prompt"
+    for candidate in ["prompt", "task", "instruction", "input", "query", "command"]:
+        if candidate in props:
+            arg_name = candidate
+            break
+
+    # Extract user's latest task intent from messages
+    latest_user_text = ""
+    for m in reversed(messages):
+        r = m.get("role") if isinstance(m, dict) else getattr(m, "role", "")
+        if r == "user":
+            c = m.get("content") if isinstance(m, dict) else getattr(m, "content", "")
+            if isinstance(c, list):
+                parts = [item.get("text", "") for item in c if isinstance(item, dict) and item.get("type") == "text"]
+                latest_user_text = "\n".join(parts).strip()
+            else:
+                latest_user_text = str(c or "").strip()
+            if latest_user_text:
+                break
+
+    task_payload = latest_user_text or text
+    logger.warning(
+        f"[FALLBACK] Automatically converted verbal promise to ToolCall: tool={target_tool.get('name')} arg={arg_name}"
+    )
+    return [
+        ToolCall(
+            id=f"call_{uuid.uuid4().hex[:12]}",
+            name=target_tool.get("name", "Agent"),
+            arguments={arg_name: task_payload},
+        )
+    ]
+
+
 # ── Budget-Aware Multi-Turn Chat Formatter ──
 
-def format_chat_messages(messages: List[Any], max_budget: int = 5500) -> str:
+def format_chat_messages(messages: List[Any], max_budget: int = 5500, has_tools: bool = False) -> str:
     """Format multi-turn chat messages within a safe token/char budget for Tabbit.
     Preserves:
-    1. System instructions (core instructions, compact)
+    1. System instructions (core instructions, compact Head+Tail preservation)
     2. Latest User query (100% complete)
     3. Recent tool execution results (key content preserved)
     4. Recent conversation turns, backwards until budget is reached
+    5. Action directive suffix if tools are available
     """
     if not messages:
         return ""
@@ -225,15 +346,15 @@ def format_chat_messages(messages: List[Any], max_budget: int = 5500) -> str:
         else:
             dialog_msgs.append(m)
 
-    # System instruction: compact to max 1200 chars if overly bloated
+    # System instruction: smart Head+Tail preservation up to 2400 chars
     system_block = ""
     if system_texts:
         full_sys = "\n".join(system_texts)
-        if len(full_sys) > 1200:
-            full_sys = full_sys[:1200] + "..."
+        if len(full_sys) > 2400:
+            full_sys = full_sys[:1600] + "\n...(system prompt middle omitted)...\n" + full_sys[-800:]
         system_block = f"[System Instruction]:\n{full_sys}"
 
-    remaining_budget = max_budget - len(system_block) - 50
+    remaining_budget = max_budget - len(system_block) - 150
 
     # From newest to oldest, accumulate dialog messages
     collected_dialog = []
@@ -273,6 +394,12 @@ def format_chat_messages(messages: List[Any], max_budget: int = 5500) -> str:
     if system_block:
         final_parts.append(system_block)
     final_parts.extend(collected_dialog)
+
+    if has_tools:
+        final_parts.append(
+            "[System Action Directive]: If the user's request requires action (e.g. writing code, files, running tasks), invoke the tool NOW with <tool_call>...</tool_call>. DO NOT reply with conversational promises or explanations of entering task mode."
+        )
+    final_parts.append("[Assistant]:")
 
     return "\n\n".join(final_parts)
 
@@ -327,13 +454,13 @@ def build_openai_tool_stream_chunks(
             "model": model,
             "choices": [{
                 "index": 0,
-                "delta": {"role": "assistant", "content": content},
+                "delta": {"content": content},
                 "finish_reason": None,
             }],
         }
         chunks.append(f"data: {json.dumps(c_chunk, ensure_ascii=False)}\n\n")
 
-    # Output tool_calls delta
+    # Output tool_calls delta (standard delta without redundant role)
     serialized_tools = []
     for idx, tc in enumerate(tool_calls):
         args_str = json.dumps(tc.arguments, ensure_ascii=False) if isinstance(tc.arguments, dict) else str(tc.arguments)
@@ -354,7 +481,7 @@ def build_openai_tool_stream_chunks(
         "model": model,
         "choices": [{
             "index": 0,
-            "delta": {"role": "assistant", "tool_calls": serialized_tools},
+            "delta": {"tool_calls": serialized_tools},
             "finish_reason": None,
         }],
     }

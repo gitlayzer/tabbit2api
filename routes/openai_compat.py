@@ -21,7 +21,7 @@ from core.agent.context_manager import SlidingWindow, ContextCompressor, estimat
 from core.agent.agent_router import ModelSelector
 from core.agent.tool_handler import (
     parse_openai_tools, build_tool_prompt, detect_tool_call,
-    detect_all_tool_calls, format_chat_messages,
+    detect_all_tool_calls, format_chat_messages, fallback_verbal_tool_call,
     build_openai_tool_stream_chunks, build_openai_tool_completion,
     build_openai_tool_response, add_tool_call, get_tool_chain, clear_tool_chain,
     ToolCall,
@@ -377,7 +377,8 @@ def _is_premium_model(model_id: str) -> bool:
 
 async def _stream_handler(
     client, session_id, content, tabbit_model, req_model,
-    completion_id, token_name, token_id, use_v3=False, has_tools=False
+    completion_id, token_name, token_id, use_v3=False, has_tools=False,
+    tools_parsed=None, messages=None
 ):
     start = time.time()
     error_msg = ""
@@ -438,14 +439,17 @@ async def _stream_handler(
                         }
                         yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
                     else:
-                        # 有 tools 对话：检查是否出现了 <tool_call
-                        if "<tool_call" in buffered_text:
+                        # 有 tools 对话：检查是否出现了任何工具调用相关标记
+                        if any(marker in buffered_text for marker in ["<tool_call", "<tool", "```tool"]):
                             in_tool_call_mode = True
 
                         if not in_tool_call_mode:
                             # 尚未出现工具调用标记，安全流式发送给客户端，保持打字机效果
                             if "<" in buffered_text:
                                 safe_len = buffered_text.rfind("<")
+                                to_send = buffered_text[len(streamed_text):safe_len]
+                            elif "`" in buffered_text:
+                                safe_len = buffered_text.rfind("`")
                                 to_send = buffered_text[len(streamed_text):safe_len]
                             else:
                                 to_send = buffered_text[len(streamed_text):]
@@ -460,9 +464,16 @@ async def _stream_handler(
                                 yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
 
         logger.info(f"[STREAM] Event loop finished: chunks={chunk_count}, buffered_len={len(buffered_text)}, has_tools={has_tools}")
+        logger.info(f"[STREAM] Model raw reply preview: {buffered_text[:200]}")
 
         if has_tools:
             clean_text, tool_calls = detect_all_tool_calls(buffered_text)
+            # 如果模型口头承诺“进入任务模式”却没输出 tool_call，触发保底转译
+            if not tool_calls and tools_parsed and messages:
+                tool_calls = fallback_verbal_tool_call(buffered_text, tools_parsed, messages)
+                if tool_calls:
+                    logger.warning(f"[STREAM] Fallback verbal tool call activated: {[tc.name for tc in tool_calls]}")
+
             if tool_calls:
                 # 提取出工具调用，输出标准的 tool_calls delta 和 finish_reason: "tool_calls"
                 chunks = build_openai_tool_stream_chunks(
@@ -543,13 +554,15 @@ async def chat_completions(
 
             # Tool calling: build compact tool prompt if tools are present
             tool_prompt = ""
+            tools_parsed = []
             if has_tools:
                 tools_parsed = parse_openai_tools(req.tools)
                 tool_prompt = build_tool_prompt(tools_parsed)
+                logger.info(f"[TOOLS] Received {len(tools_parsed)} tools: {[t.get('name') for t in tools_parsed]}")
 
             # Control total length safely within Tabbit 7500 char threshold
             remaining_budget = max(3000, 7200 - len(tool_prompt))
-            formatted_content = format_chat_messages(req.messages, max_budget=remaining_budget)
+            formatted_content = format_chat_messages(req.messages, max_budget=remaining_budget, has_tools=has_tools)
 
             if tool_prompt:
                 content = tool_prompt + "\n\n" + formatted_content
@@ -599,7 +612,8 @@ async def chat_completions(
             return StreamingResponse(
                 _stream_handler(
                     client, session_id, content, tabbit_model, getattr(req, "model", "unknown"),
-                    completion_id, token_name, token_id, use_v3=use_v3, has_tools=has_tools
+                    completion_id, token_name, token_id, use_v3=use_v3, has_tools=has_tools,
+                    tools_parsed=tools_parsed, messages=req.messages
                 ),
                 media_type="text/event-stream"
             )
@@ -609,7 +623,8 @@ async def chat_completions(
                 async with lock:
                     async for chunk in _stream_handler(
                         client, session_id, content, tabbit_model, getattr(req, "model", "unknown"),
-                        completion_id, token_name, token_id, use_v3=use_v3, has_tools=has_tools
+                        completion_id, token_name, token_id, use_v3=use_v3, has_tools=has_tools,
+                        tools_parsed=tools_parsed, messages=req.messages
                     ):
                         yield chunk
             return StreamingResponse(locked_stream(), media_type="text/event-stream")
@@ -686,8 +701,12 @@ async def chat_completions(
     output_tokens = len(full_text) // 4
 
     # Check for tool calls in non-streaming mode
-    if has_tools or "<tool_call>" in full_text:
+    if has_tools or "<tool_call" in full_text:
         clean_text, tool_calls = detect_all_tool_calls(full_text)
+        if not tool_calls and has_tools and tools_parsed:
+            tool_calls = fallback_verbal_tool_call(full_text, tools_parsed, req.messages)
+            if tool_calls:
+                logger.warning(f"[NON-STREAM] Fallback verbal tool call activated: {[tc.name for tc in tool_calls]}")
         if tool_calls:
             return build_openai_tool_completion(
                 completion_id=completion_id,
