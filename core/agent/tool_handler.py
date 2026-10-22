@@ -132,24 +132,22 @@ def build_tool_prompt(tools: List[dict], max_chars: int = 2200) -> str:
 
     prompt = (
         "【系统环境可用工具 / AVAILABLE TOOLS】\n"
-        "你当前处于 Agent 自动化开发环境中，必须通过调用以下本地工具完成文件读写、代码编写与命令执行：\n"
+        "你拥有直接操作本地开发环境的全部工具能力，通过调用以下本地工具完成文件读写、代码编写与终端命令执行：\n"
         + "\n".join(tool_lines)
         + "\n\n"
         "【执行规则（最高优先级）/ MANDATORY RULES】：\n"
-        "1. 【严禁自然语言口头承诺】：绝对禁止仅在口头上回复“我来帮你写...”、“我这就开始...”、“好的，我马上在本地为你搭建...”、“现在开始执行”等任何无意义的客套话！严禁只说不调！\n"
-        "2. 【直接以工具调用开头】：当用户要求写代码、创建修改文件、运行终端或启动任务时，你的回复必须【直接以 <tool_call> 开头】！严禁在 <tool_call> 前面输出任何中文句子！\n"
+        "1. 【直接调工具即是执行】：本地开发环境完全依赖工具驱动，不存在任何前置模式切换。收到用户的编程、文件读写或终端命令任务时，必须直接调用工具完成，无需向用户确认或宣布模式。\n"
+        "2. 【首行直接输出工具调用】：遇到需要写代码、创建修改文件、运行终端等任务，必须第一行直接输出 `<tool_call>`，切勿在调用前输出任何寒暄或客套说明。\n"
         "3. 【工具调用格式】：\n"
         "<tool_call>\n"
         '{"name": "<tool_name>", "arguments": {<json_arguments>}}\n'
         "</tool_call>\n\n"
-        "【正确示范 / CORRECT EXAMPLE】：\n"
+        "【标准示范 / EXAMPLE】：\n"
         "User: 帮我写一个 nodejs 的 api 并运行起来\n"
         "Assistant:\n"
         "<tool_call>\n"
         '{"name": "write", "arguments": {"path": "app.js", "content": "const http = require(\'http\');\\nconst server = http.createServer((req, res) => res.end(\'Hello World\'));\\nserver.listen(3000, () => console.log(\'Server on 3000\'));"}}\n'
-        "</tool_call>\n\n"
-        "【错误示范（绝对禁止）/ FORBIDDEN】：\n"
-        "好的，我来帮你创建一个简单的 Node.js Hello World API 并在本地运行起来，现在开始执行。<--- 严重违规！绝对禁止输出纯口头回复！"
+        "</tool_call>"
     )
     return prompt
 
@@ -302,6 +300,26 @@ def detect_all_tool_calls(text: str) -> Tuple[str, List[ToolCall]]:
     return clean_text, tool_calls
 
 
+VERBAL_PROMISE_KEYWORDS = [
+    "agent 模式", "agent模式", "agent 流程", "agent流程", "agent 执行流程", "agent执行流程",
+    "进入 agent", "启动 agent", "我来用 agent", "先进入 agent", "先进入agent",
+    "进入任务模式", "任务模式", "直接进入任务", "切换到任务模式",
+    "我来帮你完成", "我来帮你写", "我来帮你创建", "帮你把", "我来为你搭建", "为你搭建",
+    "我马上在本地为你", "在本地为你搭建", "我来创建", "我来用", "先进入", "准备为你",
+    "我来为你编写", "我来为你生成", "我来编写", "我来运行", "这就来动手", "这就动手",
+    "动手搭建", "我会直接创建", "这就为你", "现在开始执行",
+    "enter task mode", "entering task mode", "agent mode", "i will create", "i will implement",
+]
+
+
+def is_verbal_promise(text: str) -> bool:
+    """Detect if a reply is a purely verbal promise/evasion without calling tools."""
+    if not text:
+        return False
+    text_lower = text.lower()
+    return any(kw in text_lower for kw in VERBAL_PROMISE_KEYWORDS)
+
+
 def fallback_verbal_tool_call(
     text: str,
     tools: List[dict],
@@ -311,21 +329,7 @@ def fallback_verbal_tool_call(
     without emitting tool call tags, automatically wrap it into an Agent tool call
     to prevent desktop Agent clients (ZCode/Cline/Cursor) from stalling.
     """
-    if not tools or not text:
-        return []
-
-    # Check for verbal promise markers across variations
-    task_promise_keywords = [
-        "agent 模式", "agent模式", "agent 流程", "agent流程", "agent 执行流程", "agent执行流程",
-        "进入 agent", "启动 agent", "我来用 agent", "先进入 agent",
-        "进入任务模式", "任务模式", "直接进入任务", "切换到任务模式",
-        "我来帮你完成", "我来帮你写", "我来帮你创建", "帮你把", "我来为你搭建", "为你搭建",
-        "我马上在本地为你", "在本地为你搭建", "我来创建", "我来用", "先进入", "准备为你",
-        "我来为你编写", "我来为你生成", "我来编写", "我来运行",
-        "enter task mode", "entering task mode", "agent mode", "I will create", "I will implement",
-    ]
-    has_promise = any(kw in text.lower() for kw in task_promise_keywords)
-    if not has_promise:
+    if not tools or not text or not is_verbal_promise(text):
         return []
 
     # Find an Agent orchestration tool (e.g. ZCode's "Agent" or "Task")
@@ -492,7 +496,7 @@ def format_chat_messages(messages: List[Any], max_budget: int = 5500, has_tools:
 
     if has_tools:
         final_parts.append(
-            "[System Action Directive]: If this request involves actions (writing code, files, running commands), you MUST start your reply directly with <tool_call>. DO NOT say '我来帮你' or '现在开始执行'. Output <tool_call> immediately."
+            "[System Action Directive]: If this request involves coding, creating/editing files, or running commands, start your reply directly with `<tool_call>`."
         )
     final_parts.append("[Assistant]:")
 

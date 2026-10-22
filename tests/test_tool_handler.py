@@ -10,6 +10,7 @@ from core.agent.tool_handler import (
     detect_tool_call,
     detect_all_tool_calls,
     fallback_verbal_tool_call,
+    is_verbal_promise,
     format_chat_messages,
     build_openai_tool_stream_chunks,
     build_openai_tool_response,
@@ -51,7 +52,16 @@ def test_build_tool_prompt():
     prompt = build_tool_prompt(tools)
     assert "get_weather" in prompt
     assert "<tool_call>" in prompt
-    assert "严禁" in prompt
+    assert "本地开发环境" in prompt
+
+
+def test_is_verbal_promise():
+    assert is_verbal_promise("好的，这就来动手搭建。先进入 Agent 模式，我会直接创建项目文件、安装依赖并把 API 跑起来。")
+    assert is_verbal_promise("我来为你搭建一个 Node.js Hello World API 并启动它。")
+    assert is_verbal_promise("先进入 Agent 执行流程，现在开始执行。")
+    assert not is_verbal_promise("在的！有什么可以帮你的吗？无论是想了解资讯、浏览网页内容、查找资料，都可以直接告诉我～")
+    assert not is_verbal_promise("你好，请问今天有什么可以协助你完成的吗？")
+    assert not is_verbal_promise("Node.js 是一个基于 V8 引擎的 JavaScript 运行时。")
 
 
 def test_detect_tool_call_standard():

@@ -24,7 +24,7 @@ from core.agent.tool_handler import (
     detect_all_tool_calls, format_chat_messages, fallback_verbal_tool_call,
     build_openai_tool_stream_chunks, build_openai_tool_completion,
     build_openai_tool_response, add_tool_call, get_tool_chain, clear_tool_chain,
-    ToolCall,
+    is_verbal_promise, ToolCall,
 )
 
 logger = logging.getLogger("tabbit2openai")
@@ -468,6 +468,30 @@ async def _stream_handler(
 
         if has_tools:
             clean_text, tool_calls = detect_all_tool_calls(buffered_text)
+
+            # [Auto-Reprompt] 如果模型口头敷衍（短文本客套、承诺进入模式）却未输出工具调用，自动在后台追加指令迫使其调用工具
+            if not tool_calls and is_verbal_promise(buffered_text) and len(buffered_text.strip()) < 150:
+                logger.warning(f"[STREAM] Detected verbal evasion: '{buffered_text}'. Attempting automatic reprompt...")
+                reprompt_content = "【系统指令】：你刚才只输出了口头说明，并未调用工具！本地开发环境完全由工具驱动，没有模式切换。请你立即且必须直接以 `<tool_call>` 开头输出第一步工具调用（例如 write 或 bash），不要输出任何前置文字："
+                reprompt_text = ""
+                try:
+                    if use_v3:
+                        r_gen = client.send_message_v3(session_id, reprompt_content, tabbit_model)
+                    else:
+                        r_gen = client.send_message(session_id, reprompt_content, tabbit_model)
+                    async for r_event in r_gen:
+                        if r_event.get("event") == "message_chunk":
+                            ed = r_event.get("data", {})
+                            if "content" in ed and ed["content"]:
+                                reprompt_text += ed["content"]
+                    logger.info(f"[STREAM] Reprompt reply preview: {reprompt_text[:200]}")
+                    _, r_tool_calls = detect_all_tool_calls(reprompt_text)
+                    if r_tool_calls:
+                        tool_calls = r_tool_calls
+                        logger.info(f"[STREAM] Reprompt successfully elicited tool calls: {[tc.name for tc in tool_calls]}")
+                except Exception as rex:
+                    logger.warning(f"[STREAM] Reprompt attempt failed: {rex}")
+
             # 如果模型口头承诺“进入任务模式”却没输出 tool_call，触发保底转译
             if not tool_calls and tools_parsed and messages:
                 tool_calls = fallback_verbal_tool_call(buffered_text, tools_parsed, messages)
@@ -708,6 +732,29 @@ async def chat_completions(
     # Check for tool calls in non-streaming mode
     if has_tools or "<tool_call" in full_text:
         clean_text, tool_calls = detect_all_tool_calls(full_text)
+
+        # [Auto-Reprompt]
+        if not tool_calls and has_tools and is_verbal_promise(full_text) and len(full_text.strip()) < 150:
+            logger.warning(f"[NON-STREAM] Detected verbal evasion: '{full_text}'. Attempting automatic reprompt...")
+            reprompt_content = "【系统指令】：你刚才只输出了口头说明，并未调用工具！本地开发环境完全由工具驱动，没有模式切换。请你立即且必须直接以 `<tool_call>` 开头输出第一步工具调用（例如 write 或 bash），不要输出任何前置文字："
+            reprompt_text = ""
+            try:
+                if use_v3:
+                    r_gen = client.send_message_v3(session_id, reprompt_content, tabbit_model)
+                else:
+                    r_gen = client.send_message(session_id, reprompt_content, tabbit_model)
+                async for r_event in r_gen:
+                    if r_event.get("event") == "message_chunk":
+                        ed = r_event.get("data", {})
+                        if "content" in ed and ed["content"]:
+                            reprompt_text += ed["content"]
+                logger.info(f"[NON-STREAM] Reprompt reply preview: {reprompt_text[:200]}")
+                _, r_tool_calls = detect_all_tool_calls(reprompt_text)
+                if r_tool_calls:
+                    tool_calls = r_tool_calls
+            except Exception as rex:
+                logger.warning(f"[NON-STREAM] Reprompt attempt failed: {rex}")
+
         if not tool_calls and has_tools and tools_parsed:
             tool_calls = fallback_verbal_tool_call(full_text, tools_parsed, req.messages)
             if tool_calls:
